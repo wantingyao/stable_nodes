@@ -114,24 +114,41 @@ def _draw_streamplot(ax, x_np, y_np, U, V_f):
     ax.set_aspect('equal'); ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$")
 
 
-def _draw_lyapunov(fig, ax, x_np, y_np, V_lyap):
-    """Lyapunov contour with viridis colormap."""
-    cf = ax.contourf(x_np, y_np, V_lyap, levels=80, cmap='viridis', alpha=0.80)
-    fig.colorbar(cf, ax=ax, label='V(x)')
-    ax.contour(x_np, y_np, V_lyap, levels=12, colors='white', linewidths=0.4, alpha=0.4)
+def _draw_lyapunov_cf(ax, x_np, y_np, V_lyap, gamma=0.4):
+    """Draw Lyapunov contourf onto ax; return cf for colorbar attachment."""
+    from matplotlib.colors import PowerNorm
+    vmax = V_lyap.max()
+    levels = np.concatenate([[0.0], np.geomspace(vmax * 1e-3, vmax, 79)])
+    norm = PowerNorm(gamma=gamma, vmin=0.0, vmax=vmax)
+    cf = ax.contourf(x_np, y_np, V_lyap, levels=levels, cmap='viridis', alpha=0.80, norm=norm)
+    ax.contour(x_np, y_np, V_lyap, levels=levels[::8], colors='white', linewidths=0.4, alpha=0.4)
     ax.axhline(0, color='w', linewidth=0.5, alpha=0.5)
     ax.axvline(0, color='w', linewidth=0.5, alpha=0.5)
-    # Mark V=0 at origin (guaranteed by MakePSD construction)
     ax.plot(0.0, 0.0, 'ro', markersize=8, markeredgecolor='white', markeredgewidth=1.0,
             zorder=6, label='V=0')
-    ax.legend(loc='upper right', fontsize=8)
     ax.set_xlim(x_np[0], x_np[-1]); ax.set_ylim(y_np[0], y_np[-1])
+    return cf
+
+
+def _attach_colorbar(fig, ax, cf, label='V(x)'):
+    """Attach colorbar via make_axes_locatable so it doesn't shrink the main axis."""
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes('right', size='5%', pad=0.05)
+    fig.colorbar(cf, cax=cax, label=label)
+
+
+def _draw_lyapunov(fig, ax, x_np, y_np, V_lyap):
+    """Standalone Lyapunov panel."""
+    cf = _draw_lyapunov_cf(ax, x_np, y_np, V_lyap)
+    _attach_colorbar(fig, ax, cf)
+    ax.legend(loc='upper right', fontsize=8)
     ax.set_aspect('equal'); ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$")
 
 
 def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.1,
                      grid_data=None, probe_grid_n=8, probe_lim=1.2,
-                     lyap_data=None, fig=None, lyap_gamma=0.4):
+                     lyap_data=None, fig=None):
     """
     Reference-style panel:
       - Optional Lyapunov contourf as bottom layer (if lyap_data provided)
@@ -144,22 +161,12 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.1,
     x0_batch = data['x0']    # (7, 2)
     target   = pos_gt[0, -1] # last point of demo_0 ≈ origin
 
-    # Lyapunov contourf as bottom layer
+    # Lyapunov contourf as bottom layer (identical appearance to standalone panel)
     if lyap_data is not None:
-        from matplotlib.colors import PowerNorm
         x_np_l, y_np_l, V_lyap = lyap_data
-        vmax = V_lyap.max()
-        # Geometric levels: dense near 0, sparse at large V
-        levels = np.concatenate([[0.0], np.geomspace(vmax * 1e-3, vmax, 59)])
-        norm = PowerNorm(gamma=lyap_gamma, vmin=0.0, vmax=vmax)
-        cf = ax.contourf(x_np_l, y_np_l, V_lyap, levels=levels,
-                         cmap='viridis', alpha=0.65, norm=norm)
-        ax.contour(x_np_l, y_np_l, V_lyap, levels=levels[::5],
-                   colors='white', linewidths=0.3, alpha=0.3)
+        cf = _draw_lyapunov_cf(ax, x_np_l, y_np_l, V_lyap)
         if fig is not None:
-            fig.colorbar(cf, ax=ax, label='V(x)', pad=0.02)
-        ax.plot(0.0, 0.0, 'ro', markersize=7, markeredgecolor='white',
-                markeredgewidth=0.8, zorder=7, label='V=0')
+            _attach_colorbar(fig, ax, cf)
 
     # Streamplot background
     if grid_data is not None:
@@ -374,14 +381,14 @@ def main():
     parser = argparse.ArgumentParser(description="Train Stable NODE on LASA Leaf_2")
     parser.add_argument("--hidden_dim",    type=int,   default=64)
     parser.add_argument("--alpha",         type=float, default=1.0)
-    parser.add_argument("--epochs",        type=int,   default=500)
+    parser.add_argument("--epochs",        type=int,   default=5000)
     parser.add_argument("--lr",            type=float, default=3e-3)
     parser.add_argument("--weight_decay",  type=float, default=0.0)
-    parser.add_argument("--shape",         type=str,   default='PShape',
+    parser.add_argument("--shape",         type=str,   default='Leaf_2',
                         help="LASA shape name, e.g. Leaf_2, PShape, Angle, Sine ...")
     parser.add_argument("--logdir",        type=str,   default=None,
                         help="Override experiment dir (default: logs/snode/<shape>/<datetime>)")
-    parser.add_argument("--warmup_epochs",  type=int,   default=200,
+    parser.add_argument("--warmup_epochs",  type=int,   default=2500,
                         help="Epochs with stability off (plain NODE warm-up), then ICNN projection")
     parser.add_argument("--no_plot",        action="store_true")
     parser.add_argument("--wandb_project",  type=str,   default="stable-nodes",
