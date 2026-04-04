@@ -77,7 +77,7 @@ def load_lasa(shape='Leaf_2'):
 def build_model(hidden_dim=64, alpha=0.1, stability_mode='off'):
     fhat     = MLP(in_dim=2, out_dim=2, hidden_dim=256, num_layers=5)
     icnn     = ICNN([2, hidden_dim, hidden_dim, 1])
-    V        = MakePSD(icnn, n=2, eps=0.01, d=1.0)
+    V        = MakePSD(icnn, n=2, eps=1.0, d=1.0)
     dynamics = Dynamics(fhat, V, alpha=alpha, stability_mode=stability_mode)
     return dynamics
 
@@ -107,22 +107,17 @@ def _compute_grid(dynamics, N=41, lim=1.2):
 def _draw_streamplot(ax, x_np, y_np, U, V_f):
     """Violet streamplot matching PShape_2.png reference style."""
     ax.streamplot(x_np, y_np, U, V_f,
-                  color='mediumorchid', linewidth=0.6, arrowsize=0.7, density=1.5)
+                  color='mediumorchid', linewidth=0.6, arrowsize=0.7, density=2.0)
     ax.axhline(0, color='k', linewidth=0.4, alpha=0.4)
     ax.axvline(0, color='k', linewidth=0.4, alpha=0.4)
     ax.set_xlim(x_np[0], x_np[-1]); ax.set_ylim(y_np[0], y_np[-1])
-    ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$")
+    ax.set_aspect('equal'); ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$")
 
 
-def _draw_lyapunov(fig, ax, x_np, y_np, V_lyap, vmax_pct=70):
-    """Lyapunov contour with viridis colormap.
-    vmax_pct: colormap saturates above this percentile of V values,
-              giving finer color resolution near the origin (low V).
-    """
-    vmax = np.percentile(V_lyap, vmax_pct)
-    cf = ax.contourf(x_np, y_np, V_lyap, levels=80, cmap='viridis', alpha=0.80,
-                     vmin=0.0, vmax=vmax)
-    fig.colorbar(cf, ax=ax, label='V(x)', extend='max')
+def _draw_lyapunov(fig, ax, x_np, y_np, V_lyap):
+    """Lyapunov contour with viridis colormap."""
+    cf = ax.contourf(x_np, y_np, V_lyap, levels=80, cmap='viridis', alpha=0.80)
+    fig.colorbar(cf, ax=ax, label='V(x)')
     ax.contour(x_np, y_np, V_lyap, levels=12, colors='white', linewidths=0.4, alpha=0.4)
     ax.axhline(0, color='w', linewidth=0.5, alpha=0.5)
     ax.axvline(0, color='w', linewidth=0.5, alpha=0.5)
@@ -131,14 +126,16 @@ def _draw_lyapunov(fig, ax, x_np, y_np, V_lyap, vmax_pct=70):
             zorder=6, label='V=0')
     ax.legend(loc='upper right', fontsize=8)
     ax.set_xlim(x_np[0], x_np[-1]); ax.set_ylim(y_np[0], y_np[-1])
-    ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$")
+    ax.set_aspect('equal'); ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$")
 
 
 def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.1,
-                     grid_data=None):
+                     grid_data=None, probe_grid_n=8, probe_lim=1.2,
+                     lyap_data=None, fig=None, lyap_gamma=0.4):
     """
-    Reference-style panel (mirrors PShape_2.png):
-      - Violet streamplot as background (if grid_data provided)
+    Reference-style panel:
+      - Optional Lyapunov contourf as bottom layer (if lyap_data provided)
+      - Violet streamplot on top (if grid_data provided)
       - Ground truth demos in dodgerblue
       - Model rollouts in crimson (solid from original x0, dashed from perturbed)
       - Start: large black filled circle; Target: large black X
@@ -146,6 +143,23 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.1,
     pos_gt   = data['pos']   # (7, T, 2)
     x0_batch = data['x0']    # (7, 2)
     target   = pos_gt[0, -1] # last point of demo_0 ≈ origin
+
+    # Lyapunov contourf as bottom layer
+    if lyap_data is not None:
+        from matplotlib.colors import PowerNorm
+        x_np_l, y_np_l, V_lyap = lyap_data
+        vmax = V_lyap.max()
+        # Geometric levels: dense near 0, sparse at large V
+        levels = np.concatenate([[0.0], np.geomspace(vmax * 1e-3, vmax, 59)])
+        norm = PowerNorm(gamma=lyap_gamma, vmin=0.0, vmax=vmax)
+        cf = ax.contourf(x_np_l, y_np_l, V_lyap, levels=levels,
+                         cmap='viridis', alpha=0.65, norm=norm)
+        ax.contour(x_np_l, y_np_l, V_lyap, levels=levels[::5],
+                   colors='white', linewidths=0.3, alpha=0.3)
+        if fig is not None:
+            fig.colorbar(cf, ax=ax, label='V(x)', pad=0.02)
+        ax.plot(0.0, 0.0, 'ro', markersize=7, markeredgecolor='white',
+                markeredgewidth=0.8, zorder=7, label='V=0')
 
     # Streamplot background
     if grid_data is not None:
@@ -171,11 +185,20 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.1,
             marker='x', color='black', markersize=12,
             markeredgewidth=2.5, zorder=5, label='Target')
 
+    def _mark_endpoints(traj_np, color, markersize, alpha=1.0):
+        """Plot a triangle at the last point of each trajectory."""
+        for i in range(traj_np.shape[0]):
+            ax.plot(traj_np[i, -1, 0], traj_np[i, -1, 1],
+                    marker='^', color=color, markersize=markersize,
+                    markeredgecolor='white', markeredgewidth=0.5,
+                    alpha=alpha, zorder=6, linestyle='none')
+
     # Model rollouts from original x0 — integrate until convergence
     x_pred_np = rollout_to_convergence(dynamics, x0_batch, t_eval).cpu().numpy()
     for i in range(x_pred_np.shape[0]):
         ax.plot(x_pred_np[i, :, 0], x_pred_np[i, :, 1], c='crimson',
                 linewidth=1.8, zorder=4, label='Model' if i == 0 else None)
+    _mark_endpoints(x_pred_np, 'crimson', markersize=7)
 
     # Model rollouts from perturbed x0 (dashed, lighter)
     offsets = [np.array([perturb, 0.0]), np.array([0.0, perturb]),
@@ -190,33 +213,71 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.1,
             _perturb_labeled = True
             ax.plot(x_p_np[i, :, 0], x_p_np[i, :, 1], c='crimson',
                     linewidth=0.8, linestyle='--', alpha=0.45, zorder=4, label=label)
+        _mark_endpoints(x_p_np, 'crimson', markersize=4, alpha=0.6)
 
-    ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$")
+    # Probe rollouts from a uniform grid to reveal spurious attractors
+    xs = np.linspace(-probe_lim, probe_lim, probe_grid_n)
+    probe_x0 = torch.tensor(
+        np.stack(np.meshgrid(xs, xs), axis=-1).reshape(-1, 2),
+        dtype=torch.float32, device=x0_batch.device,
+    )  # (probe_grid_n², 2)
+    probe_np = rollout_to_convergence(dynamics, probe_x0, t_eval).cpu().numpy()
+    for i in range(probe_np.shape[0]):
+        ax.plot(probe_np[i, :, 0], probe_np[i, :, 1], c='darkorange',
+                linewidth=0.6, alpha=0.35, zorder=2,
+                label='Probe' if i == 0 else None)
+    _mark_endpoints(probe_np, 'darkorange', markersize=4, alpha=0.6)
+
+    ax.set_aspect('equal'); ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$")
     ax.set_title(title)
     ax.legend(loc='lower left', fontsize=8)
 
 
+def _make_figure(dynamics, data, t_eval, title_suffix, fig_kw):
+    """Shared 1×3 layout (or 1×1 pre-warmup): vector field | Lyapunov | combined."""
+    import matplotlib.pyplot as plt
+
+    x_np, y_np, U, V_f, V_lyap = _compute_grid(dynamics)
+    grid_data = (x_np, y_np, U, V_f)
+    lyap_data  = (x_np, y_np, V_lyap)
+
+    if dynamics.stability_mode != 'icnn':
+        fig, ax = plt.subplots(figsize=(7, 7), **fig_kw)
+        _plot_traj_panel(ax, data, dynamics, t_eval,
+                         title=f"Vector field {title_suffix}",
+                         grid_data=grid_data)
+        fig.tight_layout()
+        return fig
+
+    fig, axes = plt.subplots(1, 3, figsize=(21, 7), **fig_kw)
+
+    # Panel 1: vector field + rollouts only
+    _plot_traj_panel(axes[0], data, dynamics, t_eval,
+                     title=f"Vector field {title_suffix}",
+                     grid_data=grid_data)
+
+    # Panel 2: Lyapunov only
+    _draw_lyapunov(fig, axes[1], x_np, y_np, V_lyap)
+    axes[1].set_title(f"Lyapunov V(x) {title_suffix}")
+
+    # Panel 3: combined overlay
+    _plot_traj_panel(axes[2], data, dynamics, t_eval,
+                     title=f"Combined {title_suffix}",
+                     grid_data=grid_data,
+                     lyap_data=lyap_data, fig=fig)
+
+    fig.tight_layout()
+    return fig
+
+
 def save_intermediate_plot(dynamics, data, t_eval, epoch, logdir, use_wandb=False):
-    """Save reference-style plot every 100 epochs.
-    Post-warmup: 1x2 (trajectory | Lyapunov). Pre-warmup: single trajectory panel.
-    """
+    """Save 1×3 plot every 100 epochs."""
     import matplotlib.pyplot as plt
     dynamics.eval()
 
-    x_np, y_np, U, V_f, V_lyap = _compute_grid(dynamics)
-
-    if dynamics.stability_mode == 'icnn':
-        fig, axes = plt.subplots(1, 2, figsize=(13, 6))
-        _plot_traj_panel(axes[0], data, dynamics, t_eval,
-                         title=f"Learned vector field — Epoch {epoch}",
-                         grid_data=(x_np, y_np, U, V_f))
-        _draw_lyapunov(fig, axes[1], x_np, y_np, V_lyap)
-        axes[1].set_title(f"Lyapunov V(x) — Epoch {epoch}")
-    else:
-        fig, ax = plt.subplots(figsize=(7, 7))
-        _plot_traj_panel(ax, data, dynamics, t_eval,
-                         title=f"Learned vector field — Epoch {epoch}",
-                         grid_data=(x_np, y_np, U, V_f))
+    fig = _make_figure(dynamics, data, t_eval,
+                       title_suffix=f"— Epoch {epoch}  [{dynamics.stability_mode}]",
+                       fig_kw={})
     fig.tight_layout()
     vis_dir = os.path.join(logdir, "vis")
     os.makedirs(vis_dir, exist_ok=True)
@@ -230,24 +291,12 @@ def save_intermediate_plot(dynamics, data, t_eval, epoch, logdir, use_wandb=Fals
 
 
 def save_final_plot(dynamics, data, t_eval, loss_history, save_path):
-    """1x2: streamplot+trajectories | Lyapunov contour."""
+    """1×3: vector field | Lyapunov | combined."""
     import matplotlib.pyplot as plt
     dynamics.eval()
 
-    x_np, y_np, U, V_f, V_lyap = _compute_grid(dynamics)
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 6))
-
-    # Panel 1: streamplot + trajectories (reference style)
-    _plot_traj_panel(axes[0], data, dynamics, t_eval,
-                     title="Learned vector field",
-                     grid_data=(x_np, y_np, U, V_f))
-
-    # Panel 2: Lyapunov contour only
-    _draw_lyapunov(fig, axes[1], x_np, y_np, V_lyap)
-    axes[1].set_title("Lyapunov V(x)")
-
-    fig.tight_layout()
+    fig = _make_figure(dynamics, data, t_eval,
+                       title_suffix="", fig_kw={})
     fig_path = save_path.replace(".pt", "_results.png")
     fig.savefig(fig_path, dpi=150)
     print(f"Plot saved to {fig_path}")
@@ -324,7 +373,7 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
 def main():
     parser = argparse.ArgumentParser(description="Train Stable NODE on LASA Leaf_2")
     parser.add_argument("--hidden_dim",    type=int,   default=64)
-    parser.add_argument("--alpha",         type=float, default=0.1)
+    parser.add_argument("--alpha",         type=float, default=1.0)
     parser.add_argument("--epochs",        type=int,   default=500)
     parser.add_argument("--lr",            type=float, default=3e-3)
     parser.add_argument("--weight_decay",  type=float, default=0.0)
