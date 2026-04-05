@@ -13,10 +13,12 @@ conda activate snode
 
 ```bash
 pip install torch torchdiffeq tqdm
-pip install wandb  # optional, for logging
+pip install wandb
 ```
 
 **3. Initialize submodules**
+
+https://github.com/justagist/pyLasaDataset.git
 
 ```bash
 git submodule update --init third_party/pyLasaDataset
@@ -36,5 +38,5 @@ utils/
   node.py    # Neural ODE wrappers (NODE, SINODETaskEmbedding, MASNODETaskEmbedding)
   lsddm.py   # Lyapunov-stable dynamics (Dynamics, ICNN, MakePSD)
 scripts/     # Training scripts
-third_party/ # pyLasaDataset, hyper-node
+third_party/ # pyLasaDataset、
 ```

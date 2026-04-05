@@ -38,16 +38,17 @@ def load_lasa(shape='Leaf_2'):
 
     Returns:
         data: dict with keys
-            'pos'  : (N, 1000, 2) float32 tensor  — normalized positions
-            'x0'   : (N, 2)       float32 tensor  — initial states
-            't'    : (1000,)      float32 tensor  — shared normalized time
+            'pos'      : (N, 1000, 2) float32 tensor  — normalized & centered positions
+            'x0'       : (N, 2)       float32 tensor  — initial states
+            't'        : (1000,)      float32 tensor  — shared normalized time
+            'attractor': (2,)         float32 tensor  — attractor in normalized space (before centering)
         scale: float  — mm value corresponding to 1 in normalized space
     """
     import pyLasaDataset as lasa
 
     leaf2 = getattr(lasa.DataSet, shape)
 
-    # Scale normalization: divide by global max abs value → data in [-1, 1]²
+    # Step 1: scale normalization — divide by global max abs value → data in [-1, 1]²
     all_pos = np.concatenate([d.pos for d in leaf2.demos], axis=1)  # (2, 7000)
     scale   = np.abs(all_pos).max()
 
@@ -62,10 +63,16 @@ def load_lasa(shape='Leaf_2'):
 
     pos_batch = np.stack(pos_list, axis=0)  # (7, 1000, 2)
 
+    # Step 2: subtract attractor (mean of last positions across demos, in normalized space)
+    # so that the attractor lands exactly at the origin where V=0
+    attractor = pos_batch[:, -1, :].mean(axis=0)  # (2,)
+    pos_batch  = pos_batch - attractor[None, None, :]
+
     data = {
-        'pos': torch.tensor(pos_batch,          dtype=torch.float32),  # (7, 1000, 2)
-        'x0':  torch.tensor(pos_batch[:, 0, :], dtype=torch.float32),  # (7, 2)
-        't':   torch.tensor(t_norm,             dtype=torch.float32),  # (1000,)
+        'pos':       torch.tensor(pos_batch,          dtype=torch.float32),  # (7, 1000, 2)
+        'x0':        torch.tensor(pos_batch[:, 0, :], dtype=torch.float32),  # (7, 2)
+        't':         torch.tensor(t_norm,             dtype=torch.float32),  # (1000,)
+        'attractor': torch.tensor(attractor,          dtype=torch.float32),  # (2,)
     }
     return data, scale
 
@@ -380,8 +387,8 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
 def main():
     parser = argparse.ArgumentParser(description="Train Stable NODE on LASA Leaf_2")
     parser.add_argument("--hidden_dim",    type=int,   default=64)
-    parser.add_argument("--alpha",         type=float, default=1.0)
-    parser.add_argument("--epochs",        type=int,   default=5000)
+    parser.add_argument("--alpha",         type=float, default=0.01) # Higher alpha → stronger stability regularization (V(x) dominates over fhat(x))
+    parser.add_argument("--epochs",        type=int,   default=7000)
     parser.add_argument("--lr",            type=float, default=3e-3)
     parser.add_argument("--weight_decay",  type=float, default=0.0)
     parser.add_argument("--shape",         type=str,   default='Leaf_2',
