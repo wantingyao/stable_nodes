@@ -458,7 +458,8 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
                        "train/loss_vel": loss_vel.item(), "train/lr": cur_lr,
                        "train/stability_mode": mode_tag}, step=epoch)
 
-        # Evaluate and save best model every eval_every epochs and at the final epoch
+        # Evaluate every eval_every epochs and at the final epoch
+        post_warmup = epoch > warmup_epochs
         if epoch % eval_every == 0 or epoch == num_epochs:
             metrics = evaluate(dynamics, data, solver=solver)
             tqdm.write(
@@ -471,20 +472,36 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
                     "eval/mvd":      metrics['mvd'],
                     "eval/dtwd":     metrics['dtwd'],
                 }, step=epoch)
-            if metrics['dtwd'] < best_dtwd:
-                best_dtwd = metrics['dtwd']
-                if best_path is not None and os.path.exists(best_path):
-                    os.remove(best_path)
-                best_path = os.path.join(
-                    logdir, f"best_model_ep{epoch:04d}_dtwd_{best_dtwd:.4f}.pt"
-                )
-                torch.save({
+
+            if post_warmup:
+                ckpt = {
                     'epoch':          epoch,
+                    'dtwd':           metrics['dtwd'],
                     'model_state':    dynamics.state_dict(),
                     'metrics':        metrics,
                     'stability_mode': dynamics.stability_mode,
-                }, best_path)
-                tqdm.write(f"  → {os.path.basename(best_path)} saved")
+                }
+
+                # Save periodic checkpoint every 200 epochs after warmup
+                epochs_since_warmup = epoch - warmup_epochs
+                if epochs_since_warmup % 200 == 0 or epoch == num_epochs:
+                    ckpt_path = os.path.join(
+                        logdir, f"ckpt_ep{epoch:04d}_dtwd_{metrics['dtwd']:.4f}.pt"
+                    )
+                    torch.save(ckpt, ckpt_path)
+                    tqdm.write(f"  → {os.path.basename(ckpt_path)} saved")
+
+                # Save best model
+                if metrics['dtwd'] < best_dtwd:
+                    best_dtwd = metrics['dtwd']
+                    if best_path is not None and os.path.exists(best_path):
+                        os.remove(best_path)
+                    best_path = os.path.join(
+                        logdir, f"best_model_ep{epoch:04d}_dtwd_{best_dtwd:.4f}.pt"
+                    )
+                    torch.save(ckpt, best_path)
+                    tqdm.write(f"  → {os.path.basename(best_path)} saved (best)")
+
             save_intermediate_plot(dynamics, data, t, epoch, logdir,
                                    dtwd=metrics['dtwd'], use_wandb=use_wandb)
 
