@@ -565,7 +565,10 @@ def main():
     elif not _WANDB_AVAILABLE:
         print("wandb not installed — logging disabled. Run: pip install wandb")
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
     print(f"Device: {device}")
 
     torch.manual_seed(42)

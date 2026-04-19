@@ -1,0 +1,113 @@
+_wandb:
+    value:
+        cli_version: 0.26.0
+        e:
+            vwq99cud0kfm8v7ct018liylblcy5aqd:
+                apple:
+                    ecpuCores: 4
+                    gpuCores: 8
+                    macModel: MacBookPro17,1
+                    memoryGb: 16
+                    name: Apple M1
+                    pcpuCores: 4
+                    ramTotalBytes: "17179869184"
+                    swapTotalBytes: "8589934592"
+                args:
+                    - --shape
+                    - Angle
+                    - --epochs
+                    - "7000"
+                    - --warmup_epochs
+                    - "1000"
+                    - --hidden_dim
+                    - "64"
+                    - --alpha
+                    - "0.001"
+                    - --lr
+                    - "3e-3"
+                    - --icnn_lr_scale
+                    - "0.1"
+                    - --subsample
+                    - "5"
+                    - --pos_weight
+                    - "1.0"
+                    - --vel_weight
+                    - "1.0"
+                    - --eval_every
+                    - "100"
+                codePath: scripts/train_snode_lasa.py
+                codePathLocal: scripts/train_snode_lasa.py
+                cpu_count: 8
+                cpu_count_logical: 8
+                disk:
+                    /:
+                        total: "247192395776"
+                        used: "234891153408"
+                email: zeliaaahwang@gmail.com
+                executable: /opt/anaconda3/envs/snode/bin/python
+                git:
+                    commit: 3b522c53209e51bc9f9b0185d736f48dbc208ff1
+                    remote: https://github.com/wantingyao/stable_nodes.git
+                host: sweetiimacii.local
+                memory:
+                    total: "17179869184"
+                os: macOS-26.1-arm64-arm-64bit
+                program: /Users/zmhuang/stable_nodes/scripts/train_snode_lasa.py
+                python: CPython 3.10.20
+                root: /Users/zmhuang/stable_nodes/logs/snode/Angle/20260418_172626
+                startedAt: "2026-04-18T21:26:27.230486Z"
+                writerId: vwq99cud0kfm8v7ct018liylblcy5aqd
+        m: []
+        python_version: 3.10.20
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 2
+                - 13
+                - 16
+                - 61
+            "4": 3.10.20
+            "5": 0.26.0
+            "12": 0.26.0
+            "13": darwin-arm64
+alpha:
+    value: 0.001
+device:
+    value: cpu
+epochs:
+    value: 7000
+eval_every:
+    value: 100
+hidden_dim:
+    value: 64
+icnn_lr_scale:
+    value: 0.1
+logdir:
+    value: /Users/zmhuang/stable_nodes/logs/snode/Angle/20260418_172626
+lr:
+    value: 0.003
+n_params:
+    value: 203205
+no_plot:
+    value: false
+no_wandb:
+    value: false
+pos_weight:
+    value: 1
+shape:
+    value: Angle
+subsample:
+    value: 5
+vel_weight:
+    value: 1
+wandb_project:
+    value: stable-nodes
+wandb_run:
+    value: null
+warmup_epochs:
+    value: 1000
+weight_decay:
+    value: 0

@@ -31,7 +31,7 @@ def rollout(dynamics, x0_batch, t, method='rk4'):
         x_pred    : (N, T, d) predicted trajectories
     """
     ode_fn = make_ode_fn(dynamics)
-    out = odeint(ode_fn, x0_batch, t, method=method, options={'max_num_steps': 2000})
+    out = odeint(ode_fn, x0_batch, t, method=method, rtol=1e-3, atol=1e-4, options={'max_num_steps': 2000})
     # odeint returns (T, N, d) → (N, T, d)
     return out.permute(1, 0, 2)
 
@@ -54,7 +54,7 @@ def rollout_to_convergence(dynamics, x0_batch, t_chunk, threshold=0.001, max_chu
 
     for _ in range(max_chunks):
         with torch.enable_grad():
-            out = odeint(ode_fn, x_cur, t_chunk, method='rk4')
+            out = odeint(ode_fn, x_cur, t_chunk, method='rk4', rtol=1e-3, atol=1e-4)
         chunk = out.permute(1, 0, 2).detach()   # (N, T, d)
         chunks.append(chunk)
         x_cur = chunk[:, -1, :].clone()
@@ -106,6 +106,6 @@ class NODE(nn.Module):
 
         def func_bound(t, y):
             return self.func(y)
-        ys = odeint(func_bound, y0, ts, method="rk4")
+        ys = odeint(func_bound, y0, ts, method="rk4", rtol=1e-3, atol=1e-4)
 
         return ys.permute(1, 0, 2).contiguous()
