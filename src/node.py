@@ -37,7 +37,7 @@ def rollout(dynamics, x0_batch, t, method='rk4'):
 
 
 def rollout_to_convergence(dynamics, x0_batch, t_chunk, threshold=0.001, max_chunks=2):
-    """Integrate autonomously in fixed-length chunks until convergence, then downsample 10x.
+    """Integrate autonomously in fixed-length chunks until convergence.
 
     Args:
         dynamics   : Dynamics object
@@ -46,7 +46,7 @@ def rollout_to_convergence(dynamics, x0_batch, t_chunk, threshold=0.001, max_chu
         threshold  : convergence criterion on ||x||
         max_chunks : safety cap on number of integration chunks
     Returns:
-        traj       : (N, T_total//10, d) downsampled trajectory
+        traj       : (N, T_total, d) full trajectory (all chunks concatenated)
     """
     ode_fn = make_ode_fn(dynamics)
     x_cur  = x0_batch.clone()
@@ -62,8 +62,7 @@ def rollout_to_convergence(dynamics, x0_batch, t_chunk, threshold=0.001, max_chu
         if (x_cur.norm(dim=-1) < threshold).all():
             break
 
-    full = torch.cat(chunks, dim=1)   # (N, T_total, d)
-    return full[:, ::10, :]           # downsample 10x
+    return torch.cat(chunks, dim=1)   # (N, T_total, d)
 
 
 class MLP(nn.Module):

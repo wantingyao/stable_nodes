@@ -64,16 +64,98 @@ def load_lasa(shape='Leaf_2', subsample=5):
 
     pos_batch = np.stack(pos_list, axis=0)  # (7, T, 2)
 
-    # Step 2: subtract attractor (mean of last positions across demos, in normalized space)
-    # so that the attractor lands exactly at the origin where V=0
-    attractor = pos_batch[:, -1, :].mean(axis=0)  # (2,)
-    pos_batch  = pos_batch - attractor[None, None, :]
+    # Step 2: center on attractor first, then re-normalize so that the
+    # subsequent shift cannot push any point outside [-1, 1]².
+    attractor   = pos_batch[:, -1, :].mean(axis=0)  # (2,) in current normalized units
+    pos_batch   = pos_batch - attractor[None, None, :]
+    scale2      = float(np.abs(pos_batch).max())     # max-abs of centered data
+    pos_batch   = pos_batch / scale2
+    scale       = scale * scale2                     # physical mm per unit in final space
 
     data = {
-        'pos':       torch.tensor(pos_batch,          dtype=torch.float32),  # (7, 1000, 2)
+        'pos':       torch.tensor(pos_batch,          dtype=torch.float32),  # (7, T, 2)
         'x0':        torch.tensor(pos_batch[:, 0, :], dtype=torch.float32),  # (7, 2)
-        't':         torch.tensor(t_norm,             dtype=torch.float32),  # (1000,)
-        'attractor': torch.tensor(attractor,          dtype=torch.float32),  # (2,)
+        't':         torch.tensor(t_norm,             dtype=torch.float32),  # (T,)
+        'attractor': torch.tensor(np.zeros(2),        dtype=torch.float32),  # origin by construction
+        'dim': 2,
+    }
+    return data, scale
+
+
+# ---------------------------------------------------------------------------
+# phys-gmm data
+# ---------------------------------------------------------------------------
+
+def load_phys_gmm(dataset='2D_snake', subsample=1, T=1000):
+    """Load a phys-gmm dataset, returning the same format as load_lasa().
+
+    Some phys-gmm files store trajectories as a cell array, while the 2D toy
+    datasets store them as a flat [x; y; xdot; ydot] matrix. For flat matrices,
+    trajectory boundaries are read from discontinuities in position.
+    Positions are normalized first, then shifted so the mean endpoint attractor
+    lands at the origin. Each trajectory is remapped to T points at 1 ms steps.
+    """
+    import scipy.io
+    from scipy.interpolate import interp1d
+
+    dataset_file = dataset if dataset.endswith('.mat') else f'{dataset}.mat'
+    mat_path = os.path.join(repo, 'third_party', 'phys-gmm', 'datasets',
+                            dataset_file)
+    mat = scipy.io.loadmat(mat_path)
+
+    def split_flat_positions(pos):
+        """Read trajectory boundaries from discontinuous jumps in flat Data."""
+        if len(pos) < 2:
+            return [pos]
+
+        jumps = np.linalg.norm(np.diff(pos, axis=0), axis=1)
+        median = float(np.median(jumps))
+        q1, q3 = np.percentile(jumps, [25, 75])
+        iqr = float(q3 - q1)
+        threshold = max(10.0 * median, float(q3 + 10.0 * iqr), 1e-12)
+        split_after = np.flatnonzero(jumps > threshold)
+
+        starts = np.r_[0, split_after + 1]
+        ends = np.r_[split_after + 1, len(pos)]
+        return [pos[s:e] for s, e in zip(starts, ends) if e - s >= 2]
+
+    if 'Data' in mat:
+        D = mat['Data']
+        dim = D.shape[0] // 2
+        pos_all = D[:dim, :].T
+        trajs = [traj[::subsample] for traj in split_flat_positions(pos_all)]
+    else:
+        cells = mat['data'].ravel()
+        dim = cells[0].shape[0] // 2
+        trajs = [cell[:dim, ::subsample].T for cell in cells]
+
+    trajs = [traj for traj in trajs if len(traj) >= 2]
+    if not trajs:
+        raise ValueError(f"No valid trajectories found in {dataset_file}.")
+    traj_lengths = [int(len(traj)) for traj in trajs]
+
+    # Use a fixed 1 ms step: 1000 remapped samples cover [0, 0.999] seconds.
+    t_new = np.arange(T, dtype=np.float32) / 1000.0
+
+    def resample(traj):
+        t_old = np.linspace(0.0, float(t_new[-1]), len(traj))
+        return interp1d(t_old, traj, axis=0)(t_new).astype(np.float32)
+
+    pos_batch = np.stack([resample(traj) for traj in trajs], axis=0)  # (N, T, 2)
+
+    # Normalize first, then shift the normalized attractor to the origin.
+    scale = float(np.abs(pos_batch).max())
+    pos_batch = pos_batch / scale
+    attractor = pos_batch[:, -1, :].mean(axis=0)
+    pos_batch = pos_batch - attractor[None, None, :]
+
+    data = {
+        'pos':       torch.tensor(pos_batch,           dtype=torch.float32),  # (N, T, dim)
+        'x0':        torch.tensor(pos_batch[:, 0, :],  dtype=torch.float32),  # (N, dim)
+        't':         torch.tensor(t_new,               dtype=torch.float32),  # (T,)
+        'attractor': torch.zeros(dim,                  dtype=torch.float32),
+        'traj_lengths': traj_lengths,
+        'dim': dim,
     }
     return data, scale
 
@@ -82,10 +164,10 @@ def load_lasa(shape='Leaf_2', subsample=5):
 # Model
 # ---------------------------------------------------------------------------
 
-def build_model(hidden_dim=64, alpha=0.1, stability_mode='off'):
-    fhat     = MLP(in_dim=2, out_dim=2, hidden_dim=256, num_layers=5)
-    icnn     = ICNN([2, hidden_dim, hidden_dim, 1])
-    V        = MakePSD(icnn, n=2, eps=1.0, d=1.0)
+def build_model(hidden_dim=256, alpha=0.1, stability_mode='off', eps=1.0, d=1.0, dim=2):
+    fhat     = MLP(in_dim=dim, out_dim=dim, hidden_dim=256, num_layers=5)
+    icnn     = ICNN([dim, hidden_dim, hidden_dim, hidden_dim, hidden_dim, 1])
+    V        = MakePSD(icnn, n=dim, eps=eps, d=d)
     dynamics = Dynamics(fhat, V, alpha=alpha, stability_mode=stability_mode)
     return dynamics
 
@@ -103,13 +185,20 @@ def _compute_grid(dynamics, N=41, lim=1.2):
 
     with torch.enable_grad():
         grid_g = grid.clone().requires_grad_(True)
-        vel    = dynamics(grid_g).detach()
-        V_vals = dynamics.V(grid_g).detach()
+        vel    = dynamics(grid_g)
+        V_vals = dynamics.V(grid_g)
+        gV     = torch.autograd.grad(V_vals.sum(), grid_g, create_graph=False)[0]
+        dotV   = (gV * vel).sum(dim=1, keepdim=True)
+
+        vel    = vel.detach()
+        V_vals = V_vals.detach()
+        dotV   = dotV.detach()
 
     U      = vel[:, 0].reshape(N, N).cpu().numpy()
     V_f    = vel[:, 1].reshape(N, N).cpu().numpy()
     V_lyap = V_vals[:, 0].reshape(N, N).cpu().numpy()
-    return x_lin.numpy(), y_lin.numpy(), U, V_f, V_lyap
+    dotV_h = dotV[:, 0].reshape(N, N).cpu().numpy()
+    return x_lin.numpy(), y_lin.numpy(), U, V_f, V_lyap, dotV_h
 
 
 def _draw_streamplot(ax, x_np, y_np, U, V_f):
@@ -154,7 +243,81 @@ def _draw_lyapunov(fig, ax, x_np, y_np, V_lyap):
     ax.set_aspect('equal'); ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$")
 
 
-def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.1,
+def _draw_lyapunov_surface_3d(ax, x_np, y_np, V_lyap, U=None, V_f=None):
+    """3D surface plot of V(x1, x2) with floor contours and f(x) arrow.
+
+    _compute_grid uses torch indexing='xy': V_lyap[row, col] = V(x_np[col], y_np[row]).
+    We apply log1p transform so the bowl shape is visible even when V spans many orders
+    of magnitude — this is more reliable than PowerNorm with plot_surface.
+    """
+    # Match _compute_grid's indexing='xy'
+    XX, YY = np.meshgrid(x_np, y_np, indexing='xy')
+
+    # log1p compresses large V values while preserving bowl shape near origin
+    V_disp = V_lyap ** 0.4
+    vmin = float(V_disp.min())
+    vmax = float(V_disp.max())
+
+    surf = ax.plot_surface(XX, YY, V_disp, cmap='viridis',
+                           vmin=vmin, vmax=vmax,
+                           alpha=0.7, linewidth=0, antialiased=True,
+                           rcount=60, ccount=60)
+
+    # Floor contours projected at z=vmin
+    n_floor = 16
+    floor_levels = np.linspace(vmin, vmax, n_floor)
+    ax.contourf(XX, YY, V_disp, levels=floor_levels, cmap='viridis',
+                alpha=0.55, zdir='z', offset=vmin)
+    ax.contour(XX, YY, V_disp, levels=floor_levels[::4], colors='white',
+               linewidths=0.4, alpha=0.55, zdir='z', offset=vmin)
+
+    # f(x) arrow — pick upper-left quadrant, V_lyap[row=iy, col=ix]
+    if U is not None and V_f is not None:
+        N_x, N_y = len(x_np), len(y_np)
+        ix, iy = N_x // 3, 2 * N_y // 3
+        px = float(x_np[ix])
+        py = float(y_np[iy])
+        pv = float(V_disp[iy, ix])
+        scale = (x_np[-1] - x_np[0]) * 0.18
+        raw = np.hypot(float(U[iy, ix]), float(V_f[iy, ix])) + 1e-8
+        dx = float(U[iy, ix]) / raw * scale
+        dy = float(V_f[iy, ix]) / raw * scale
+        ax.quiver(px, py, pv, dx, dy, 0,
+                  color='white', linewidth=2.0, arrow_length_ratio=0.4, zorder=8)
+        ax.text(px + dx * 1.5, py + dy * 1.5, pv + (vmax - vmin) * 0.06,
+                r'$f(x)$', color='white', fontsize=10, zorder=9)
+
+    # Attractor at origin
+    ax.scatter([0], [0], [vmin], c='red', s=80, zorder=10)
+
+    ax.set_zlim(vmin, vmax)
+    ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$"); ax.set_zlabel("$\ln(1+V)$")
+    ax.set_title("Lyapunov $V(x)$")
+    # elev=30 shows depth; azim=-60 (near default) shows both axes clearly
+    ax.view_init(elev=30, azim=-60)
+    return surf
+
+
+def _draw_dotv(fig, ax, x_np, y_np, dotV):
+    """Standalone dV/dt panel. Positive regions indicate Lyapunov violation."""
+    vmin = min(float(np.nanmin(dotV)), 0.0)
+    vmax = max(float(np.nanmax(dotV)), 0.0)
+    if vmax - vmin < 1e-8:
+        vmax = vmin + 1e-8
+    levels = np.linspace(vmin, vmax, 81)
+    cf = ax.contourf(x_np, y_np, dotV, levels=levels, cmap='seismic_r',
+                     vmin=vmin, vmax=vmax, extend='both')
+    if vmin <= 0.0 <= vmax:
+        ax.contour(x_np, y_np, dotV, levels=[0.0], colors='black',
+                   linewidths=0.8, alpha=0.8)
+    ax.axhline(0, color='k', linewidth=0.4, alpha=0.4)
+    ax.axvline(0, color='k', linewidth=0.4, alpha=0.4)
+    ax.set_xlim(x_np[0], x_np[-1]); ax.set_ylim(y_np[0], y_np[-1])
+    ax.set_aspect('equal'); ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$")
+    _attach_colorbar(fig, ax, cf, label=r"$\nabla V \cdot f$")
+
+
+def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.02,
                      grid_data=None, probe_grid_n=8, probe_lim=1.2,
                      lyap_data=None, fig=None, show_probe=False):
     """
@@ -165,11 +328,15 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.1,
       - Model rollouts in crimson (solid from original x0, dashed from perturbed)
       - Start: large black filled circle; Target: large black X
     """
-    pos_gt   = data['pos']   # (7, T, 2)
-    x0_batch = data['x0']    # (7, 2)
-    target   = pos_gt[0, -1] # last point of demo_0 ≈ origin
+    if t_eval is None:
+        device = next(dynamics.parameters()).device
+        t_eval = torch.linspace(0.0, 1.0, 1000, device=device)
 
-    # Lyapunov contourf as bottom layer (identical appearance to standalone panel)
+    pos_gt   = data['pos']   # (N, T, 2)
+    x0_batch = data['x0']    # (N, 2)
+    target   = data.get('attractor', pos_gt[0, -1])
+
+    # Lyapunov contourf as bottom layer
     if lyap_data is not None:
         x_np_l, y_np_l, V_lyap = lyap_data
         cf = _draw_lyapunov_cf(ax, x_np_l, y_np_l, V_lyap)
@@ -188,14 +355,14 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.1,
                 linewidth=1.5, alpha=0.7, label='Real' if i == 0 else None,
                 zorder=3)
 
-    # Start points (large black filled circle, like reference)
+    # Start points
     for i in range(pos_gt.shape[0]):
         ax.plot(pos_gt[i, 0, 0].item(), pos_gt[i, 0, 1].item(),
                 marker='o', color='black', markersize=10,
                 markeredgecolor='black', zorder=5,
                 label='Start' if i == 0 else None)
 
-    # Target (large black X, like reference)
+    # Target
     ax.plot(target[0].item(), target[1].item(),
             marker='x', color='black', markersize=12,
             markeredgewidth=2.5, zorder=5, label='Target')
@@ -208,11 +375,14 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.1,
                     markeredgecolor='white', markeredgewidth=0.5,
                     alpha=alpha, zorder=6, linestyle='none')
 
-    # Model rollouts from original x0 — integrate until convergence
-    x_pred_np = rollout_to_convergence(dynamics, x0_batch, t_eval).cpu().numpy()
+    # timeout: at most 5× the demo length
+    max_chunks = max(1, int(np.ceil(5 * pos_gt.shape[1] / len(t_eval))))
+    x_pred_np = rollout_to_convergence(dynamics, x0_batch, t_eval,
+                                       max_chunks=max_chunks).cpu().numpy()
     for i in range(x_pred_np.shape[0]):
         ax.plot(x_pred_np[i, :, 0], x_pred_np[i, :, 1], c='crimson',
-                linewidth=1.8, zorder=4, label='Model' if i == 0 else None)
+                linewidth=1.5,
+                zorder=4, label='Model' if i == 0 else None)
     _mark_endpoints(x_pred_np, 'crimson', markersize=7)
 
     # Model rollouts from perturbed x0 (dashed, lighter)
@@ -222,7 +392,8 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.1,
     for offset in offsets:
         x0_p = (x0_batch + torch.tensor(offset, dtype=torch.float32,
                                          device=x0_batch.device)).clamp(-1.2, 1.2)
-        x_p_np = rollout_to_convergence(dynamics, x0_p, t_eval).cpu().numpy()
+        x_p_np = rollout_to_convergence(dynamics, x0_p, t_eval,
+                                        max_chunks=max_chunks).cpu().numpy()
         for i in range(x_p_np.shape[0]):
             label = 'Perturbed' if not _perturb_labeled else None
             _perturb_labeled = True
@@ -236,8 +407,9 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.1,
         probe_x0 = torch.tensor(
             np.stack(np.meshgrid(xs, xs), axis=-1).reshape(-1, 2),
             dtype=torch.float32, device=x0_batch.device,
-        )  # (probe_grid_n², 2)
-        probe_np = rollout_to_convergence(dynamics, probe_x0, t_eval).cpu().numpy()
+        )
+        probe_np = rollout_to_convergence(dynamics, probe_x0, t_eval,
+                                          max_chunks=max_chunks).cpu().numpy()
         for i in range(probe_np.shape[0]):
             ax.plot(probe_np[i, :, 0], probe_np[i, :, 1], c='darkorange',
                     linewidth=0.6, alpha=0.35, zorder=2,
@@ -249,35 +421,175 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.1,
     ax.legend(loc='lower left', fontsize=8)
 
 
-def _make_figure(dynamics, data, t_eval, title_suffix, fig_kw):
-    """Shared 1×3 layout (or 1×1 pre-warmup): vector field | Lyapunov | combined."""
+def _plot_traj_panel_3d(ax, data, dynamics, t_eval, title="", perturb=0.02):
+    """3D trajectory panel: GT demos in blue, model rollouts in red."""
+    if t_eval is None:
+        device = next(dynamics.parameters()).device
+        t_eval = torch.linspace(0.0, 1.0, 1000, device=device)
+
+    pos_gt   = data['pos']    # (N, T, 3)
+    x0_batch = data['x0']     # (N, 3)
+
+    for i in range(pos_gt.shape[0]):
+        traj = pos_gt[i].cpu().numpy()
+        ax.plot(traj[:, 0], traj[:, 1], traj[:, 2],
+                c='dodgerblue', linewidth=1.2, alpha=0.7,
+                label='Real' if i == 0 else None)
+        ax.scatter(traj[0, 0], traj[0, 1], traj[0, 2],
+                   c='black', s=40, zorder=5,
+                   label='Start' if i == 0 else None)
+
+    ax.scatter(0.0, 0.0, 0.0, c='black', marker='x', s=100, linewidths=2,
+               zorder=5, label='Target')
+
+    max_chunks = max(1, int(np.ceil(5 * pos_gt.shape[1] / len(t_eval))))
+    x_pred_np = rollout_to_convergence(dynamics, x0_batch, t_eval,
+                                       max_chunks=max_chunks).cpu().numpy()
+    for i in range(x_pred_np.shape[0]):
+        ax.plot(x_pred_np[i, :, 0], x_pred_np[i, :, 1], x_pred_np[i, :, 2],
+                c='crimson', linewidth=1.2, zorder=4,
+                label='Model' if i == 0 else None)
+
+    offsets = [np.array([perturb, 0.0, 0.0]), np.array([0.0, perturb, 0.0]),
+               np.array([0.0, 0.0, perturb])]
+    _perturb_labeled = False
+    for offset in offsets:
+        x0_p = (x0_batch + torch.tensor(offset, dtype=torch.float32,
+                                         device=x0_batch.device)).clamp(-1.2, 1.2)
+        x_p_np = rollout_to_convergence(dynamics, x0_p, t_eval,
+                                        max_chunks=max_chunks).cpu().numpy()
+        for i in range(x_p_np.shape[0]):
+            label = 'Perturbed' if not _perturb_labeled else None
+            _perturb_labeled = True
+            ax.plot(x_p_np[i, :, 0], x_p_np[i, :, 1], x_p_np[i, :, 2],
+                    c='crimson', linewidth=0.7, linestyle='--', alpha=0.4,
+                    zorder=3, label=label)
+
+    ax.invert_yaxis()
+    ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$"); ax.set_zlabel("$x_3$")
+    ax.set_title(title)
+    ax.legend(loc='upper left', fontsize=7)
+    ax.invert_yaxis()
+    ax.view_init(elev=25, azim=160, roll=0)  # looking from negative x1 toward +x1
+
+
+def _plot_lyapunov_surface(ax, dynamics, lim=0.9, grid_n=60, n_contours=12, slice_dim=2):
+    """3D surface of V(x1,x2) at slice_dim=0 plane, with contour lines at the base."""
+    from matplotlib.colors import PowerNorm
+
+    device = next(dynamics.parameters()).device
+    lin = np.linspace(-lim, lim, grid_n)
+    A, B = np.meshgrid(lin, lin, indexing='ij')   # (G, G)
+
+    axes = [0, 1, 2]
+    free = [a for a in axes if a != slice_dim]
+    pts_np = np.zeros((grid_n * grid_n, 3), dtype=np.float32)
+    pts_np[:, free[0]] = A.ravel()
+    pts_np[:, free[1]] = B.ravel()
+
+    with torch.no_grad():
+        V_surf = dynamics.V(
+            torch.tensor(pts_np, device=device)
+        ).cpu().numpy().ravel().reshape(grid_n, grid_n)
+
+    vmax = float(V_surf.max())
+    norm = PowerNorm(gamma=0.4, vmin=0.0, vmax=vmax)
+
+    ax.plot_surface(A, B, V_surf, cmap='viridis', norm=norm,
+                    alpha=0.45, linewidth=0, antialiased=True)
+
+    levels = np.concatenate([[0.0], np.geomspace(vmax * 1e-3, vmax, n_contours - 1)])
+    ax.contour(A, B, V_surf, levels=levels, zdir='z', offset=0,
+               cmap='viridis', norm=norm, linewidths=0.8, alpha=0.8)
+
+    ax.scatter(0, 0, 0, c='red', marker='o', s=60, zorder=5)
+    labels = ["$x_1$", "$x_2$", "$x_3$"]
+    ax.set_xlabel(labels[free[0]])
+    ax.set_ylabel(labels[free[1]])
+    ax.set_zlabel("$V(x)$")
+    ax.set_title(f"Lyapunov $V(x)$  [slice $x_{{{slice_dim+1}}}=0$]")
+    ax.view_init(elev=30, azim=-60)
+
+
+def _make_figure_3d(dynamics, data, t_eval, title_suffix, fig_kw):
+    """
+    Warmup:    1 panel  — trajectories only
+    icnn phase: 3 panels — trajectories | Lyapunov surface | combined
+    """
     import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-    x_np, y_np, U, V_f, V_lyap = _compute_grid(dynamics)
-    grid_data = (x_np, y_np, U, V_f)
-    lyap_data  = (x_np, y_np, V_lyap)
+    show_lyap = dynamics.stability_mode == 'icnn'
 
-    if dynamics.stability_mode != 'icnn':
-        fig, ax = plt.subplots(figsize=(7, 7), **fig_kw)
-        _plot_traj_panel(ax, data, dynamics, t_eval,
-                         title=f"Vector field {title_suffix}",
-                         grid_data=grid_data)
+    if not show_lyap:
+        fig = plt.figure(figsize=(9, 7), **fig_kw)
+        ax3d = fig.add_subplot(111, projection='3d')
+        _plot_traj_panel_3d(ax3d, data, dynamics, t_eval,
+                            title=f"3D trajectories {title_suffix}")
         fig.tight_layout()
         return fig
 
-    fig, axes = plt.subplots(1, 3, figsize=(21, 7), **fig_kw)
+    fig = plt.figure(figsize=(24, 7), **fig_kw)
 
-    # Panel 1: vector field + rollouts only
-    _plot_traj_panel(axes[0], data, dynamics, t_eval,
+    # Panel 1: trajectories only
+    ax_traj = fig.add_subplot(131, projection='3d')
+    _plot_traj_panel_3d(ax_traj, data, dynamics, t_eval,
+                        title=f"Trajectories {title_suffix}")
+
+    # Panel 2: Lyapunov surface only
+    ax_ly = fig.add_subplot(132, projection='3d')
+    _plot_lyapunov_surface(ax_ly, dynamics)
+
+    # Panel 3: combined — Lyapunov surface + trajectories overlaid
+    ax_comb = fig.add_subplot(133, projection='3d')
+    _plot_lyapunov_surface(ax_comb, dynamics)
+    _plot_traj_panel_3d(ax_comb, data, dynamics, t_eval, title=f"Combined {title_suffix}")
+
+    fig.tight_layout()
+    return fig
+
+
+def _make_figure(dynamics, data, t_eval, title_suffix, fig_kw):
+    """Shared 1×4 layout (or 1×1 pre-warmup): vector field | Lyapunov 3D surface | dV/dt | combined."""
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    if dynamics.stability_mode != 'icnn':
+        # Warmup: skip V evaluation entirely
+        x_np, y_np, U, V_f, _, _ = _compute_grid(dynamics)
+        fig, ax = plt.subplots(figsize=(7, 7), **fig_kw)
+        _plot_traj_panel(ax, data, dynamics, t_eval,
+                         title=f"Vector field {title_suffix}",
+                         grid_data=(x_np, y_np, U, V_f))
+        fig.tight_layout()
+        return fig
+
+    x_np, y_np, U, V_f, V_lyap, dotV = _compute_grid(dynamics)
+    grid_data = (x_np, y_np, U, V_f)
+    lyap_data  = (x_np, y_np, V_lyap)
+
+    fig = plt.figure(figsize=(28, 7), **fig_kw)
+
+    # Panel 1: vector field + rollouts (2D)
+    ax1 = fig.add_subplot(1, 4, 1)
+    _plot_traj_panel(ax1, data, dynamics, t_eval,
                      title=f"Vector field {title_suffix}",
                      grid_data=grid_data)
 
-    # Panel 2: Lyapunov only
-    _draw_lyapunov(fig, axes[1], x_np, y_np, V_lyap)
-    axes[1].set_title(f"Lyapunov V(x) {title_suffix}")
+    # Panel 2: Lyapunov 3D surface
+    ax2 = fig.add_subplot(1, 4, 2, projection='3d')
+    surf = _draw_lyapunov_surface_3d(ax2, x_np, y_np, V_lyap, U=U, V_f=V_f)
+    ax2.set_title(f"Lyapunov $V(x)$ {title_suffix}", pad=12)
+    fig.colorbar(surf, ax=ax2, shrink=0.55, pad=0.1, label='$V(x)$')
 
-    # Panel 3: combined overlay
-    _plot_traj_panel(axes[2], data, dynamics, t_eval,
+    # Panel 3: dV/dt heatmap (2D)
+    ax3 = fig.add_subplot(1, 4, 3)
+    _draw_dotv(fig, ax3, x_np, y_np, dotV)
+    ax3.set_title(r"$\dot V = \nabla V \cdot f$ " + title_suffix)
+
+    # Panel 4: combined overlay (2D)
+    ax4 = fig.add_subplot(1, 4, 4)
+    _plot_traj_panel(ax4, data, dynamics, t_eval,
                      title=f"Combined {title_suffix}",
                      grid_data=grid_data,
                      lyap_data=lyap_data, fig=fig)
@@ -287,15 +599,18 @@ def _make_figure(dynamics, data, t_eval, title_suffix, fig_kw):
 
 
 def save_intermediate_plot(dynamics, data, t_eval, epoch, logdir, dtwd=None, use_wandb=False):
-    """Save 1×3 plot every eval_every epochs."""
+    """Save plot every eval_every epochs (2D: streamplot; 3D: trajectory axes)."""
     import matplotlib.pyplot as plt
     dynamics.eval()
 
+    dim = data.get('dim', data['pos'].shape[-1])
     dtwd_tag = f"_dtwd_{dtwd:.4f}" if dtwd is not None else ""
-    fig = _make_figure(dynamics, data, t_eval,
-                       title_suffix=f"— Epoch {epoch}  [{dynamics.stability_mode}]"
-                                    + (f"  DTWD={dtwd:.4f}" if dtwd is not None else ""),
-                       fig_kw={})
+    title_suffix = (f"— Epoch {epoch}  [{dynamics.stability_mode}]"
+                    + (f"  DTWD={dtwd:.4f}" if dtwd is not None else ""))
+    if dim == 3:
+        fig = _make_figure_3d(dynamics, data, t_eval, title_suffix=title_suffix, fig_kw={})
+    else:
+        fig = _make_figure(dynamics, data, t_eval, title_suffix=title_suffix, fig_kw={})
     fig.tight_layout()
     vis_dir = os.path.join(logdir, "vis")
     os.makedirs(vis_dir, exist_ok=True)
@@ -309,12 +624,15 @@ def save_intermediate_plot(dynamics, data, t_eval, epoch, logdir, dtwd=None, use
 
 
 def save_final_plot(dynamics, data, t_eval, loss_history, save_path):
-    """1×3: vector field | Lyapunov | combined."""
+    """Final result plot (2D: streamplot panels; 3D: 3D trajectory axes)."""
     import matplotlib.pyplot as plt
     dynamics.eval()
 
-    fig = _make_figure(dynamics, data, t_eval,
-                       title_suffix="", fig_kw={})
+    dim = data.get('dim', data['pos'].shape[-1])
+    if dim == 3:
+        fig = _make_figure_3d(dynamics, data, t_eval, title_suffix="", fig_kw={})
+    else:
+        fig = _make_figure(dynamics, data, t_eval, title_suffix="", fig_kw={})
     fig_path = save_path.replace(".pt", "_results.png")
     fig.savefig(fig_path, dpi=150)
     print(f"Plot saved to {fig_path}")
@@ -338,7 +656,7 @@ def _dtw_distance(p: np.ndarray, q: np.ndarray) -> float:
 
 
 @torch.no_grad()
-def evaluate(dynamics, data, solver='rk4') -> dict:
+def evaluate(dynamics, data, solver='dopri5') -> dict:
     """Compute RMSE_vel, MVD, and DTWD on the LASA demos.
 
     - RMSE_vel / MVD: computed at GT trajectory positions (independent of rollout).
@@ -347,30 +665,26 @@ def evaluate(dynamics, data, solver='rk4') -> dict:
     Returns a dict with keys: rmse_vel, mvd, dtwd (all Python floats).
     """
     dynamics.eval()
+
     pos_gt   = data['pos']   # (N, T, 2)
     t        = data['t']     # (T,)
     N, T, d  = pos_gt.shape
 
-    # --- velocity metrics (at GT positions) ---
-    dt       = t[1:] - t[:-1]                                           # (T-1,)
-    vel_gt   = (pos_gt[:, 1:, :] - pos_gt[:, :-1, :]) / dt[None, :, None]  # (N, T-1, 2)
+    dt       = t[1:] - t[:-1]
+    vel_gt   = (pos_gt[:, 1:, :] - pos_gt[:, :-1, :]) / dt[None, :, None]
     x_flat   = pos_gt[:, :-1, :].reshape(-1, d).requires_grad_(True)
     with torch.enable_grad():
-        vel_pred = dynamics(x_flat).reshape(N, T - 1, d)                # (N, T-1, 2)
+        vel_pred = dynamics(x_flat).reshape(N, T - 1, d)
 
-    err      = (vel_pred - vel_gt).norm(dim=-1)   # (N, T-1)
+    err      = (vel_pred - vel_gt).norm(dim=-1)
     mvd      = err.mean().item()
     rmse_vel = err.pow(2).mean().sqrt().item()
 
-    # --- DTWD (rollout vs GT) ---
-    x0_batch = data['x0']                                               # (N, 2)
+    x0_batch = data['x0']
     with torch.enable_grad():
-        x_pred = rollout(dynamics, x0_batch, t, method=solver).detach() # (N, T, 2)
-    dtwd_vals = []
-    for i in range(N):
-        p = x_pred[i].cpu().numpy()
-        q = pos_gt[i].cpu().numpy()
-        dtwd_vals.append(_dtw_distance(p, q))
+        x_pred = rollout(dynamics, x0_batch, t, method=solver).detach()
+    dtwd_vals = [_dtw_distance(x_pred[i].cpu().numpy(), pos_gt[i].cpu().numpy())
+                 for i in range(N)]
     dtwd = float(np.mean(dtwd_vals))
 
     return {'rmse_vel': rmse_vel, 'mvd': mvd, 'dtwd': dtwd}
@@ -382,19 +696,25 @@ def evaluate(dynamics, data, solver='rk4') -> dict:
 
 def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
           warmup_epochs=200, pos_weight=1.0, vel_weight=1.0, use_wandb=False,
-          icnn_lr_scale=0.1, eval_every=100):
-    """Two-phase training:
-      epoch 1 .. warmup_epochs     : stability_mode='off'  (plain NODE, lr)
-      epoch warmup_epochs+1 .. end : stability_mode='icnn' (all params, lr * icnn_lr_scale)
+          icnn_lr_scale=0.1, eval_every=100, lyapunov_only_epochs=200):
+    """Three-phase training:
+      phase 1: epoch 1 .. warmup_epochs
+               stability_mode='off', all params, lr
+      phase 2a: epoch warmup_epochs+1 .. warmup_epochs+lyapunov_only_epochs
+               stability_mode='icnn', fhat frozen, only V trained, lr * icnn_lr_scale
+      phase 2b: epoch warmup_epochs+lyapunov_only_epochs+1 .. end
+               stability_mode='icnn', all params unfrozen, lr * icnn_lr_scale
     """
-    x0_batch = data['x0']   # (7, 2)
-    pos_gt   = data['pos']  # (7, T_sub, 2)
-    t        = data['t']    # (T_sub,)
+    x0_batch = data.get('x0')
+    pos_gt   = data.get('pos')
+    t        = data.get('t')
+
+    phase2a_start = warmup_epochs + 1
+    phase2b_start = warmup_epochs + lyapunov_only_epochs + 1
 
     optimizer = torch.optim.Adam(
         dynamics.parameters(), lr=lr, weight_decay=weight_decay
     )
-    # CosineAnnealingLR, mirroring algo_testnode.py
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=warmup_epochs, eta_min=lr * 0.1
     )
@@ -402,40 +722,55 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
     loss_history = []
     best_dtwd    = float('inf')
     best_path    = None
-    solver       = 'dopri5'   # phase 1: adaptive; switches to rk4 at phase 2
+    solver       = 'dopri5'
     pbar = tqdm(range(1, num_epochs + 1), desc="Training", dynamic_ncols=True)
 
     for epoch in pbar:
-        # Phase 1 → 2: switch to ICNN projection after warm-up
-        if epoch == warmup_epochs + 1:
+        # Phase 1 → 2a: enable ICNN stability, freeze fhat, train V only
+        if epoch == phase2a_start:
             dynamics.stability_mode = 'icnn'
             dynamics.V.invalidate_zero_cache()
+            for p in dynamics.fhat.parameters():
+                p.requires_grad_(False)
             phase2_lr = lr * icnn_lr_scale
+            optimizer = torch.optim.Adam(
+                filter(lambda p: p.requires_grad, dynamics.parameters()),
+                lr=phase2_lr, weight_decay=weight_decay,
+            )
+            remaining = num_epochs - warmup_epochs
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=remaining, eta_min=phase2_lr * 0.1
+            )
+            solver = 'dopri5'
+            tqdm.write(f"\n[Epoch {epoch}] Phase 2a — V only (fhat frozen), lr={phase2_lr:.2e}")
+
+        # Phase 2a → 2b: unfreeze fhat, joint fine-tuning
+        if epoch == phase2b_start:
+            for p in dynamics.fhat.parameters():
+                p.requires_grad_(True)
             optimizer = torch.optim.Adam(
                 dynamics.parameters(), lr=phase2_lr, weight_decay=weight_decay,
             )
+            remaining2b = num_epochs - phase2b_start + 1
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=num_epochs - warmup_epochs, eta_min=phase2_lr * 0.1
+                optimizer, T_max=max(remaining2b, 1), eta_min=phase2_lr * 0.1
             )
-            solver = 'rk4'
-            tqdm.write(f"\n[Epoch {epoch}] Stability ON — mode=icnn, lr={phase2_lr:.2e}, solver=rk4")
+            tqdm.write(f"\n[Epoch {epoch}] Phase 2b — joint fine-tuning (all params)")
 
         dynamics.train()
         optimizer.zero_grad()
 
-        # Batched rollout over all 7 demos in one odeint call (skip if pos_weight=0)
         if pos_weight > 0.0:
-            x_pred   = rollout(dynamics, x0_batch, t, method=solver)   # (7, T_sub, 2)
+            x_pred   = rollout(dynamics, x0_batch, t, method=solver)
             loss_pos = F.mse_loss(x_pred, pos_gt)
         else:
             loss_pos = torch.tensor(0.0, device=x0_batch.device)
 
-        # Velocity loss: single-step f(x) vs finite-difference GT velocity
-        dt       = t[1:] - t[:-1]                               # (T_sub-1,)
-        vel_gt   = (pos_gt[:, 1:, :] - pos_gt[:, :-1, :]) / dt[None, :, None]  # (7, T_sub-1, 2)
+        dt       = t[1:] - t[:-1]
+        vel_gt   = (pos_gt[:, 1:, :] - pos_gt[:, :-1, :]) / dt[None, :, None]
         N, _, d  = pos_gt.shape
-        x_flat   = pos_gt[:, :-1, :].reshape(-1, d).requires_grad_(True)       # (7*(T_sub-1), 2)
-        vel_pred = dynamics(x_flat).reshape(N, -1, d)           # (7, T_sub-1, 2)
+        x_flat   = pos_gt[:, :-1, :].reshape(-1, d).requires_grad_(True)
+        vel_pred = dynamics(x_flat).reshape(N, -1, d)
         loss_vel = F.mse_loss(vel_pred, vel_gt)
 
         loss = pos_weight * loss_pos + vel_weight * loss_vel
@@ -461,17 +796,20 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
         # Evaluate every eval_every epochs and at the final epoch
         post_warmup = epoch > warmup_epochs
         if epoch % eval_every == 0 or epoch == num_epochs:
-            metrics = evaluate(dynamics, data, solver=solver)
+            metrics  = evaluate(dynamics, data, solver=solver)
+            dtwd_str = f"{metrics['dtwd']:.4f}" if not (metrics['dtwd'] != metrics['dtwd']) else "N/A"
             tqdm.write(
                 f"[Epoch {epoch:>5}]  RMSE_vel={metrics['rmse_vel']:.6f}"
-                f"  MVD={metrics['mvd']:.6f}  DTWD={metrics['dtwd']:.4f}"
+                f"  MVD={metrics['mvd']:.6f}  DTWD={dtwd_str}"
             )
             if use_wandb and _WANDB_AVAILABLE:
-                wandb.log({
-                    "eval/rmse_vel": metrics['rmse_vel'],
-                    "eval/mvd":      metrics['mvd'],
-                    "eval/dtwd":     metrics['dtwd'],
-                }, step=epoch)
+                log_d = {"eval/rmse_vel": metrics['rmse_vel'], "eval/mvd": metrics['mvd']}
+                if not (metrics['dtwd'] != metrics['dtwd']):
+                    log_d["eval/dtwd"] = metrics['dtwd']
+                wandb.log(log_d, step=epoch)
+
+            best_metric     = metrics['dtwd']
+            best_metric_tag = "dtwd"
 
             if post_warmup:
                 ckpt = {
@@ -486,18 +824,18 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
                 epochs_since_warmup = epoch - warmup_epochs
                 if epochs_since_warmup % 200 == 0 or epoch == num_epochs:
                     ckpt_path = os.path.join(
-                        logdir, f"ckpt_ep{epoch:04d}_dtwd_{metrics['dtwd']:.4f}.pt"
+                        logdir, f"ckpt_ep{epoch:04d}_{best_metric_tag}_{best_metric:.4f}.pt"
                     )
                     torch.save(ckpt, ckpt_path)
                     tqdm.write(f"  → {os.path.basename(ckpt_path)} saved")
 
                 # Save best model
-                if metrics['dtwd'] < best_dtwd:
-                    best_dtwd = metrics['dtwd']
+                if best_metric < best_dtwd:
+                    best_dtwd = best_metric
                     if best_path is not None and os.path.exists(best_path):
                         os.remove(best_path)
                     best_path = os.path.join(
-                        logdir, f"best_model_ep{epoch:04d}_dtwd_{best_dtwd:.4f}.pt"
+                        logdir, f"best_model_ep{epoch:04d}_{best_metric_tag}_{best_dtwd:.4f}.pt"
                     )
                     torch.save(ckpt, best_path)
                     tqdm.write(f"  → {os.path.basename(best_path)} saved (best)")
@@ -513,9 +851,9 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Stable NODE on LASA Leaf_2")
+    parser = argparse.ArgumentParser(description="Train Stable NODE on 2D_messy-snake")
     parser.add_argument("--hidden_dim",    type=int,   default=64)
-    parser.add_argument("--alpha",         type=float, default=0.001) # Higher alpha → stronger stability regularization (V(x) dominates over fhat(x))
+    parser.add_argument("--alpha",         type=float, default=0.1) # Higher alpha → stronger stability regularization (V(x) dominates over fhat(x))
     parser.add_argument("--epochs",        type=int,   default=7000)
     parser.add_argument("--lr",            type=float, default=3e-3)
     parser.add_argument("--weight_decay",  type=float, default=0.0)
@@ -523,18 +861,29 @@ def main():
                         help="LASA shape name, e.g. Leaf_2, PShape, Angle, Sine ...")
     parser.add_argument("--subsample",     type=int,   default=1,
                         help="Take every N-th time step (1=no subsampling, 5=200pts)")
-    parser.add_argument("--pos_weight",    type=float, default=1.0,
+    parser.add_argument("--pos_weight",    type=float, default=0,
                         help="Weight for position rollout loss term (0=disable)")
     parser.add_argument("--vel_weight",    type=float, default=1.0,
                         help="Weight for velocity loss term (0=disable)")
     parser.add_argument("--logdir",        type=str,   default=None,
                         help="Override experiment dir (default: logs/snode/<shape>/<datetime>)")
-    parser.add_argument("--warmup_epochs",  type=int,   default=1000,
+    parser.add_argument("--warmup_epochs",  type=int,   default=100,
                         help="Epochs with stability off (plain NODE warm-up), then ICNN projection")
-    parser.add_argument("--icnn_lr_scale",   type=float, default=0.1,
+    parser.add_argument("--icnn_lr_scale",        type=float, default=0.1,
                         help="LR multiplier for phase 2 (icnn), applied to both fhat and V")
+    parser.add_argument("--lyapunov_only_epochs", type=int,   default=0,
+                        help="Epochs after warmup where fhat is frozen and only V is trained (phase 2a)")
     parser.add_argument("--eval_every",      type=int,   default=100,
-                        help="Run evaluation every N epochs (default: 100)")
+                        help="Run evaluation and visualization every N epochs (default: 10)")
+    parser.add_argument("--source",          type=str,   default='phys-gmm',
+                        choices=['lasa', 'phys-gmm'],
+                        help="Dataset source: 'phys-gmm' (default) or 'lasa'")
+    parser.add_argument("--phys_gmm_name",  type=str,   default='2D_messy-snake',
+                        help="phys-gmm dataset name, e.g. '2D_snake', '2D_Sshape' (only used with --source phys-gmm)")
+    parser.add_argument("--eps",            type=float, default=0.1,
+                        help="MakePSD quadratic floor coefficient (smaller → V less quadratic)")
+    parser.add_argument("--d",              type=float, default=1e-5,
+                        help="ReHU knee point in MakePSD (smaller → ICNN activates closer to origin)")
     parser.add_argument("--no_plot",        action="store_true")
     parser.add_argument("--wandb_project",  type=str,   default="stable-nodes",
                         help="W&B project name")
@@ -547,17 +896,18 @@ def main():
     use_wandb = _WANDB_AVAILABLE and not args.no_wandb
 
     # Resolve experiment directory
-    run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _ds_tag    = args.phys_gmm_name if args.source == 'phys-gmm' else args.shape
     if args.logdir is None:
-        args.logdir = os.path.join(repo, "logs", "snode", args.shape, run_name)
+        args.logdir = os.path.join(repo, "logs", "snode", _ds_tag, run_name)
     os.makedirs(args.logdir, exist_ok=True)
-    save_path = os.path.join(args.logdir, "snode_lasa.pt")
+    save_path = os.path.join(args.logdir, "snode.pt")
     print(f"Experiment directory: {args.logdir}")
 
     if use_wandb:
         wandb.init(
             project=args.wandb_project,
-            name=args.wandb_run or f"{args.shape}_{run_name}",
+            name=args.wandb_run or f"{_ds_tag}_{run_name}",
             config=vars(args),
             dir=args.logdir,
         )
@@ -571,29 +921,44 @@ def main():
     torch.manual_seed(42)
     np.random.seed(42)
 
-    print(f"Loading LASA {args.shape} ...")
-    data, scale = load_lasa(shape=args.shape, subsample=args.subsample)
-    data = {k: v.to(device) for k, v in data.items()}
-    print(f"  {data['pos'].shape[0]} demos, {data['pos'].shape[1]} time points each")
-    print(f"  scale={scale:.2f} mm  (data in [-1, 1])")
+    if args.source == 'phys-gmm':
+        print(f"Loading phys-gmm {args.phys_gmm_name} ...")
+        data, scale = load_phys_gmm(dataset=args.phys_gmm_name,
+                                    subsample=args.subsample)
+        data = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in data.items()}
+        print(f"  {data['pos'].shape[0]} trajectories, {data['pos'].shape[1]} time points each")
+        print(f"  original trajectory lengths: {data['traj_lengths']}")
+        print(f"  mean endpoint after shift: {data['pos'][:, -1, :].mean(dim=0).detach().cpu().numpy()}")
+        print(f"  scale={scale:.4f}  (normalized before attractor shift)")
+    else:
+        print(f"Loading LASA {args.shape} ...")
+        data, scale = load_lasa(shape=args.shape, subsample=args.subsample)
+        data = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+        print(f"  {data['pos'].shape[0]} demos, {data['pos'].shape[1]} time points each")
+        print(f"  scale={scale:.2f} mm  (data in [-1, 1])")
 
+    dim = int(data.get('dim', data['pos'].shape[-1]))
+    print(f"  state dimension: {dim}D")
     dynamics = build_model(hidden_dim=args.hidden_dim, alpha=args.alpha,
-                           stability_mode='off').to(device)
+                           stability_mode='off', eps=args.eps, d=args.d, dim=dim).to(device)
     n_params = sum(p.numel() for p in dynamics.parameters() if p.requires_grad)
     print(f"Model: {n_params} trainable parameters")
 
     if use_wandb:
         wandb.config.update({"n_params": n_params, "device": str(device)})
 
+    p2a_end = args.warmup_epochs + args.lyapunov_only_epochs
     print(f"\nTraining for {args.epochs} epochs ...")
-    print(f"  0–{args.warmup_epochs}: plain NODE  |  "
-          f"{args.warmup_epochs+1}–{args.epochs}: ICNN V")
+    print(f"  1–{args.warmup_epochs}: plain NODE  |  "
+          f"{args.warmup_epochs+1}–{p2a_end}: V only (fhat frozen)  |  "
+          f"{p2a_end+1}–{args.epochs}: joint fine-tune")
     loss_history = train(
         dynamics, data, args.logdir,
         num_epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
         warmup_epochs=args.warmup_epochs, pos_weight=args.pos_weight, vel_weight=args.vel_weight,
         use_wandb=use_wandb, icnn_lr_scale=args.icnn_lr_scale,
-        eval_every=args.eval_every,
+        eval_every=args.eval_every, lyapunov_only_epochs=args.lyapunov_only_epochs,
     )
 
     torch.save({
@@ -605,7 +970,7 @@ def main():
     print(f"\nModel saved to {save_path}")
 
     if not args.no_plot:
-        save_final_plot(dynamics, data, data['t'], loss_history, save_path)
+        save_final_plot(dynamics, data, data.get('t'), loss_history, save_path)
 
     if use_wandb:
         wandb.finish()
