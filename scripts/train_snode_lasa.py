@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(repo, "utils"))
 sys.path.insert(0, os.path.join(repo, "src"))   # must be first: shadows utils/node.py
 
 from node import MLP, rollout, rollout_to_convergence
-from lsddm import Dynamics, ICNN, MakePSD
+from lsddm import Dynamics, ICNN, MakePSD, PolarLimitCycleShapeFn, LimitCycleV
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +78,61 @@ def load_lasa(shape='Leaf_2', subsample=5):
         't':         torch.tensor(t_norm,             dtype=torch.float32),  # (T,)
         'attractor': torch.tensor(np.zeros(2),        dtype=torch.float32),  # origin by construction
         'dim': 2,
+    }
+    return data, scale
+
+
+# ---------------------------------------------------------------------------
+# IROS dataset
+# ---------------------------------------------------------------------------
+
+IROS_SHAPES = ['IShape', 'RShape', 'SShape', 'OShape']
+
+def load_iros(shape='IShape', subsample=1, center_mode='endpoint'):
+    """Load an IROS dataset shape (.npy file with shape (N, T, 2)).
+
+    Args:
+        shape:       one of 'IShape', 'RShape', 'SShape', 'OShape'
+        subsample:   take every N-th time step
+        center_mode: 'endpoint' — shift mean endpoint to origin (default)
+                     'centroid' — shift trajectory centroid to origin; required for
+                                  limit-cycle mode so the origin lies inside the curve
+                                  and V_lc = phi(x)^2 has a non-trivial level set
+
+    Returns the same dict format as load_lasa():
+        data: 'pos' (N,T,2), 'x0' (N,2), 't' (T,), 'attractor' (2,), 'dim'
+        scale: float — physical units per normalized unit
+    """
+    iros_dir = os.path.join(repo, 'third_party', 'CLF-CBF-NODE', 'Dataset', 'IROS_dataset')
+    path = os.path.join(iros_dir, f'{shape}.npy')
+    pos_batch = np.load(path).astype(np.float64)  # (N, T, 2)
+
+    pos_batch = pos_batch[:, ::subsample, :]       # (N, T', 2)
+
+    scale = float(np.abs(pos_batch).max())
+    if scale > 0:
+        pos_batch = pos_batch / scale
+
+    if center_mode == 'centroid':
+        center = pos_batch.mean(axis=(0, 1))       # geometric centroid of all points
+    else:
+        center = pos_batch[:, -1, :].mean(axis=0)  # mean endpoint
+    pos_batch = pos_batch - center[None, None, :]
+
+    scale2 = float(np.abs(pos_batch).max())
+    if scale2 > 0:
+        pos_batch = pos_batch / scale2
+    scale = scale * scale2
+
+    N, T, d = pos_batch.shape
+    t_norm = np.linspace(0.0, 1.0, T, dtype=np.float32)
+
+    data = {
+        'pos':       torch.tensor(pos_batch, dtype=torch.float32),   # (N, T, 2)
+        'x0':        torch.tensor(pos_batch[:, 0, :], dtype=torch.float32),  # (N, 2)
+        't':         torch.tensor(t_norm, dtype=torch.float32),       # (T,)
+        'attractor': torch.zeros(d, dtype=torch.float32),
+        'dim': d,
     }
     return data, scale
 
@@ -164,10 +219,132 @@ def load_phys_gmm(dataset='2D_snake', subsample=1, T=1000):
 # Model
 # ---------------------------------------------------------------------------
 
-def build_model(hidden_dim=256, alpha=0.1, stability_mode='off', eps=1.0, d=1.0, dim=2):
-    fhat     = MLP(in_dim=dim, out_dim=dim, hidden_dim=256, num_layers=5)
-    icnn     = ICNN([dim, hidden_dim, hidden_dim, hidden_dim, hidden_dim, 1])
-    V        = MakePSD(icnn, n=dim, eps=eps, d=d)
+def train_shape_fn(phi, data, epochs=1000, lr=1e-3):
+    """Phase 0: learn phi(x)=0 on demo trajectories.
+
+    PolarLimitCycleShapeFn guarantees a closed zero set by construction, so
+    no eikonal regularizer is needed — the on-curve loss alone is sufficient.
+    """
+    device  = next(phi.parameters()).device
+    pos     = data['pos']                              # (N, T, d)
+    x_curve = pos.reshape(-1, pos.shape[-1])           # (N*T, d) — points on the cycle
+
+    opt  = torch.optim.Adam(phi.parameters(), lr=lr)
+    pbar = tqdm(range(epochs), desc="Shape fn (phi)", dynamic_ncols=True)
+    for ep in pbar:
+        loss = phi(x_curve).pow(2).mean()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        if ep % 100 == 0 or ep == epochs - 1:
+            pbar.set_postfix(loss=f"{loss.item():.6f}")
+
+    tqdm.write(f"  phi training done — on-curve |phi|.mean = {phi(x_curve).abs().mean().item():.6f}")
+
+
+def save_shape_fn_plot(phi, data, save_path, lim=1.3, grid_n=300):
+    """Visualize the learned polar shape function phi after Phase 0.
+
+    Four panels:
+      1. phi(x) signed heatmap — blue inside cycle, red outside; white line = phi=0.
+      2. |phi(x)| — distance-like to the cycle; dark band = the cycle itself.
+      3. r(theta) polar plot — the learned radius function; directly shows the
+         closed curve shape in polar coordinates around the centroid.
+      4. Overlay — demo trajectories vs learned phi=0 contour in Cartesian space.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+
+    device = next(phi.parameters()).device
+    phi.eval()
+
+    # Cartesian grid evaluation
+    xs     = torch.linspace(-lim, lim, grid_n, device=device)
+    XX, YY = torch.meshgrid(xs, xs, indexing='xy')
+    grid   = torch.stack([XX.ravel(), YY.ravel()], dim=1)
+    with torch.no_grad():
+        phi_vals = phi(grid)                         # (N, 1)
+    phi_np  = phi_vals.cpu().numpy().reshape(grid_n, grid_n)
+    xs_np   = xs.cpu().numpy()
+
+    # Polar r(theta) evaluation
+    theta_np = np.linspace(0, 2 * np.pi, 720)
+    cos_sin  = torch.tensor(
+        np.stack([np.cos(theta_np), np.sin(theta_np)], axis=1), dtype=torch.float32, device=device
+    )
+    with torch.no_grad():
+        r_vals = phi.r_net(cos_sin).cpu().numpy().ravel()   # (720,)
+
+    # Cartesian coords of the learned cycle from polar parameterization
+    cycle_x = r_vals * np.cos(theta_np)
+    cycle_y = r_vals * np.sin(theta_np)
+
+    pos_gt = data['pos'].cpu().numpy()               # (N_demo, T, 2)
+
+    fig = plt.figure(figsize=(22, 6))
+    gs  = fig.add_gridspec(1, 4, wspace=0.35)
+
+    # --- Panel 1: signed phi heatmap ---
+    ax = fig.add_subplot(gs[0])
+    vabs = float(np.abs(phi_np).max())
+    norm = mcolors.TwoSlopeNorm(vmin=-vabs, vcenter=0.0, vmax=vabs)
+    cf   = ax.contourf(xs_np, xs_np, phi_np, levels=80, cmap='RdBu_r', norm=norm, alpha=0.85)
+    ax.contour(xs_np, xs_np, phi_np, levels=[0.0], colors='white', linewidths=2.0)
+    for i in range(pos_gt.shape[0]):
+        ax.plot(pos_gt[i, :, 0], pos_gt[i, :, 1], c='lime', linewidth=1.2, alpha=0.8,
+                label='Demo' if i == 0 else None)
+    ax.scatter(0, 0, c='yellow', s=60, zorder=5, label='centroid')
+    fig.colorbar(cf, ax=ax, label='phi(x)', shrink=0.85)
+    ax.set_aspect('equal'); ax.set_title('phi(x)\n[white = phi=0 cycle]')
+    ax.legend(fontsize=7, loc='lower right')
+    ax.set_xlabel('$x_1$'); ax.set_ylabel('$x_2$')
+
+    # --- Panel 2: |phi| heatmap ---
+    ax = fig.add_subplot(gs[1])
+    cf2 = ax.contourf(xs_np, xs_np, np.abs(phi_np), levels=60, cmap='viridis', alpha=0.85)
+    ax.contour(xs_np, xs_np, phi_np, levels=[0.0], colors='white', linewidths=2.0)
+    for i in range(pos_gt.shape[0]):
+        ax.plot(pos_gt[i, :, 0], pos_gt[i, :, 1], c='lime', linewidth=1.2, alpha=0.8)
+    fig.colorbar(cf2, ax=ax, label='|phi(x)|', shrink=0.85)
+    ax.set_aspect('equal'); ax.set_title('|phi(x)|  = sqrt(V_lc)\n[dark band = on cycle]')
+    ax.set_xlabel('$x_1$'); ax.set_ylabel('$x_2$')
+
+    # --- Panel 3: r(theta) polar plot ---
+    ax = fig.add_subplot(gs[2], projection='polar')
+    ax.plot(theta_np, r_vals, c='crimson', linewidth=2.0, label='r(theta)')
+    ax.fill(theta_np, r_vals, alpha=0.15, color='crimson')
+    ax.set_title('r(theta) — learned radius\n[closed by construction]', pad=18)
+    ax.set_rlabel_position(45)
+
+    # --- Panel 4: Cartesian overlay ---
+    ax = fig.add_subplot(gs[3])
+    for i in range(pos_gt.shape[0]):
+        ax.plot(pos_gt[i, :, 0], pos_gt[i, :, 1], c='dodgerblue', linewidth=1.5, alpha=0.8,
+                label='Demo' if i == 0 else None)
+    ax.plot(cycle_x, cycle_y, c='crimson', linewidth=2.0, label='phi=0 (polar)')
+    ax.scatter(0, 0, c='black', s=60, zorder=5, label='centroid')
+    ax.set_aspect('equal'); ax.set_title('Demo vs learned cycle\n[Cartesian overlay]')
+    ax.legend(fontsize=7, loc='lower right')
+    ax.set_xlabel('$x_1$'); ax.set_ylabel('$x_2$')
+
+    fig.suptitle('Phase 0 — Learned Polar Shape Function phi(x) = ||x|| - r(theta)',
+                 fontsize=13)
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Shape function plot saved to {save_path}")
+    phi.train()
+
+
+def build_model(hidden_dim=256, alpha=0.1, stability_mode='off', eps=1.0, d=1.0, dim=2,
+                limit_cycle=False, phi_hidden=64):
+    fhat = MLP(in_dim=dim, out_dim=dim, hidden_dim=256, num_layers=5)
+    if limit_cycle:
+        phi = PolarLimitCycleShapeFn(hidden=phi_hidden)
+        V   = LimitCycleV(phi)
+    else:
+        icnn = ICNN([dim, hidden_dim, hidden_dim, hidden_dim, hidden_dim, 1])
+        V    = MakePSD(icnn, n=dim, eps=eps, d=d)
     dynamics = Dynamics(fhat, V, alpha=alpha, stability_mode=stability_mode)
     return dynamics
 
@@ -375,8 +552,8 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.02,
                     markeredgecolor='white', markeredgewidth=0.5,
                     alpha=alpha, zorder=6, linestyle='none')
 
-    # timeout: at most 5× the demo length
-    max_chunks = max(1, int(np.ceil(5 * pos_gt.shape[1] / len(t_eval))))
+    is_lc = getattr(dynamics, 'stability_mode', '') == 'limit_cycle'
+    max_chunks = max(15 if is_lc else 1, int(np.ceil(5 * pos_gt.shape[1] / len(t_eval))))
     x_pred_np = rollout_to_convergence(dynamics, x0_batch, t_eval,
                                        max_chunks=max_chunks).cpu().numpy()
     for i in range(x_pred_np.shape[0]):
@@ -415,6 +592,20 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.02,
                     linewidth=0.6, alpha=0.35, zorder=2,
                     label='Probe' if i == 0 else None)
         _mark_endpoints(probe_np, 'darkorange', markersize=4, alpha=0.6)
+
+    # For limit cycle mode, draw the learned phi=0 contour (the limit cycle shape)
+    if getattr(dynamics, 'stability_mode', '') == 'limit_cycle':
+        lim = 1.3
+        N_g = 200
+        device = next(dynamics.parameters()).device
+        xs = torch.linspace(-lim, lim, N_g, device=device)
+        XX, YY = torch.meshgrid(xs, xs, indexing='xy')
+        grid = torch.stack([XX.ravel(), YY.ravel()], dim=1)
+        with torch.no_grad():
+            phi_grid = dynamics.V.phi(grid).reshape(N_g, N_g).cpu().numpy()
+        ax.contour(xs.cpu().numpy(), xs.cpu().numpy(), phi_grid,
+                   levels=[0.0], colors='white', linewidths=1.5, linestyles='--',
+                   zorder=5)
 
     ax.set_aspect('equal'); ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$")
     ax.set_title(title)
@@ -696,19 +887,26 @@ def evaluate(dynamics, data, solver='dopri5') -> dict:
 
 def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
           warmup_epochs=200, pos_weight=1.0, vel_weight=1.0, use_wandb=False,
-          icnn_lr_scale=0.1, eval_every=100, lyapunov_only_epochs=200):
-    """Three-phase training:
-      phase 1: epoch 1 .. warmup_epochs
-               stability_mode='off', all params, lr
-      phase 2a: epoch warmup_epochs+1 .. warmup_epochs+lyapunov_only_epochs
-               stability_mode='icnn', fhat frozen, only V trained, lr * icnn_lr_scale
-      phase 2b: epoch warmup_epochs+lyapunov_only_epochs+1 .. end
-               stability_mode='icnn', all params unfrozen, lr * icnn_lr_scale
+          icnn_lr_scale=0.1, eval_every=100, lyapunov_only_epochs=200,
+          limit_cycle=False):
+    """Three-phase training.
+
+    Standard (limit_cycle=False):
+      phase 1:  epoch 1..warmup_epochs       — stability_mode='off', all params
+      phase 2a: warmup+1..warmup+lyap_only   — stability_mode='icnn', fhat frozen
+      phase 2b: warmup+lyap_only+1..end      — stability_mode='icnn', all params
+
+    Limit cycle (limit_cycle=True):
+      phase 1:  epoch 1..warmup_epochs       — stability_mode='off', all params
+                (phi already trained in phase 0 before this call)
+      phase 2a: warmup+1..warmup+lyap_only   — stability_mode='limit_cycle', fhat frozen
+      phase 2b: warmup+lyap_only+1..end      — stability_mode='limit_cycle', all params
     """
     x0_batch = data.get('x0')
     pos_gt   = data.get('pos')
     t        = data.get('t')
 
+    phase2_mode   = 'limit_cycle' if limit_cycle else 'icnn'
     phase2a_start = warmup_epochs + 1
     phase2b_start = warmup_epochs + lyapunov_only_epochs + 1
 
@@ -726,9 +924,9 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
     pbar = tqdm(range(1, num_epochs + 1), desc="Training", dynamic_ncols=True)
 
     for epoch in pbar:
-        # Phase 1 → 2a: enable ICNN stability, freeze fhat, train V only
+        # Phase 1 → 2a: enable stability projection, freeze fhat, train V / phi only
         if epoch == phase2a_start:
-            dynamics.stability_mode = 'icnn'
+            dynamics.stability_mode = phase2_mode
             dynamics.V.invalidate_zero_cache()
             for p in dynamics.fhat.parameters():
                 p.requires_grad_(False)
@@ -742,7 +940,7 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
                 optimizer, T_max=remaining, eta_min=phase2_lr * 0.1
             )
             solver = 'dopri5'
-            tqdm.write(f"\n[Epoch {epoch}] Phase 2a — V only (fhat frozen), lr={phase2_lr:.2e}")
+            tqdm.write(f"\n[Epoch {epoch}] Phase 2a — {phase2_mode} V/phi only (fhat frozen), lr={phase2_lr:.2e}")
 
         # Phase 2a → 2b: unfreeze fhat, joint fine-tuning
         if epoch == phase2b_start:
@@ -861,13 +1059,13 @@ def main():
                         help="LASA shape name, e.g. Leaf_2, PShape, Angle, Sine ...")
     parser.add_argument("--subsample",     type=int,   default=1,
                         help="Take every N-th time step (1=no subsampling, 5=200pts)")
-    parser.add_argument("--pos_weight",    type=float, default=0,
+    parser.add_argument("--pos_weight",    type=float, default=0.0,
                         help="Weight for position rollout loss term (0=disable)")
     parser.add_argument("--vel_weight",    type=float, default=1.0,
                         help="Weight for velocity loss term (0=disable)")
     parser.add_argument("--logdir",        type=str,   default=None,
                         help="Override experiment dir (default: logs/snode/<shape>/<datetime>)")
-    parser.add_argument("--warmup_epochs",  type=int,   default=100,
+    parser.add_argument("--warmup_epochs",  type=int,   default=5000,
                         help="Epochs with stability off (plain NODE warm-up), then ICNN projection")
     parser.add_argument("--icnn_lr_scale",        type=float, default=0.1,
                         help="LR multiplier for phase 2 (icnn), applied to both fhat and V")
@@ -876,14 +1074,28 @@ def main():
     parser.add_argument("--eval_every",      type=int,   default=100,
                         help="Run evaluation and visualization every N epochs (default: 10)")
     parser.add_argument("--source",          type=str,   default='phys-gmm',
-                        choices=['lasa', 'phys-gmm'],
-                        help="Dataset source: 'phys-gmm' (default) or 'lasa'")
+                        choices=['lasa', 'phys-gmm', 'iros'],
+                        help="Dataset source: 'phys-gmm' (default), 'lasa', or 'iros'")
     parser.add_argument("--phys_gmm_name",  type=str,   default='2D_messy-snake',
                         help="phys-gmm dataset name, e.g. '2D_snake', '2D_Sshape' (only used with --source phys-gmm)")
+    parser.add_argument("--iros_shape",     type=str,   default='OShape',
+                        choices=IROS_SHAPES,
+                        help="IROS dataset shape name (only used with --source iros)")
     parser.add_argument("--eps",            type=float, default=0.1,
                         help="MakePSD quadratic floor coefficient (smaller → V less quadratic)")
     parser.add_argument("--d",              type=float, default=1e-5,
                         help="ReHU knee point in MakePSD (smaller → ICNN activates closer to origin)")
+    parser.add_argument("--limit_cycle",    action="store_true",
+                        help="Enable limit-cycle mode: learn phi(x)=0 on curve, use V_lc=phi^2")
+    parser.add_argument("--center_mode",    type=str,   default='endpoint',
+                        choices=['endpoint', 'centroid'],
+                        help="IROS centering: 'endpoint' (default) or 'centroid' (required for limit_cycle)")
+    parser.add_argument("--shape_fn_epochs", type=int,  default=1000,
+                        help="Epochs for phase-0 shape function (phi) training")
+    parser.add_argument("--shape_fn_lr",   type=float, default=1e-3,
+                        help="Learning rate for phi training")
+    parser.add_argument("--phi_hidden",    type=int,   default=64,
+                        help="Hidden dim of PolarLimitCycleShapeFn r_net MLP")
     parser.add_argument("--no_plot",        action="store_true")
     parser.add_argument("--wandb_project",  type=str,   default="stable-nodes",
                         help="W&B project name")
@@ -897,7 +1109,12 @@ def main():
 
     # Resolve experiment directory
     run_name   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    _ds_tag    = args.phys_gmm_name if args.source == 'phys-gmm' else args.shape
+    if args.source == 'phys-gmm':
+        _ds_tag = args.phys_gmm_name
+    elif args.source == 'iros':
+        _ds_tag = args.iros_shape
+    else:
+        _ds_tag = args.shape
     if args.logdir is None:
         args.logdir = os.path.join(repo, "logs", "snode", _ds_tag, run_name)
     os.makedirs(args.logdir, exist_ok=True)
@@ -931,6 +1148,16 @@ def main():
         print(f"  original trajectory lengths: {data['traj_lengths']}")
         print(f"  mean endpoint after shift: {data['pos'][:, -1, :].mean(dim=0).detach().cpu().numpy()}")
         print(f"  scale={scale:.4f}  (normalized before attractor shift)")
+    elif args.source == 'iros':
+        center_mode = 'centroid' if args.limit_cycle else args.center_mode
+        print(f"Loading IROS {args.iros_shape} (center_mode={center_mode}) ...")
+        data, scale = load_iros(shape=args.iros_shape, subsample=args.subsample,
+                                center_mode=center_mode)
+        data = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in data.items()}
+        print(f"  {data['pos'].shape[0]} demos, {data['pos'].shape[1]} time points each")
+        print(f"  mean endpoint after shift: {data['pos'][:, -1, :].mean(dim=0).detach().cpu().numpy()}")
+        print(f"  scale={scale:.4f}  (normalized before attractor shift)")
     else:
         print(f"Loading LASA {args.shape} ...")
         data, scale = load_lasa(shape=args.shape, subsample=args.subsample)
@@ -941,17 +1168,30 @@ def main():
     dim = int(data.get('dim', data['pos'].shape[-1]))
     print(f"  state dimension: {dim}D")
     dynamics = build_model(hidden_dim=args.hidden_dim, alpha=args.alpha,
-                           stability_mode='off', eps=args.eps, d=args.d, dim=dim).to(device)
+                           stability_mode='off', eps=args.eps, d=args.d, dim=dim,
+                           limit_cycle=args.limit_cycle,
+                           phi_hidden=args.phi_hidden).to(device)
     n_params = sum(p.numel() for p in dynamics.parameters() if p.requires_grad)
     print(f"Model: {n_params} trainable parameters")
 
     if use_wandb:
         wandb.config.update({"n_params": n_params, "device": str(device)})
 
+    # Phase 0 (limit cycle only): learn shape function phi before dynamics training
+    if args.limit_cycle:
+        print(f"\nPhase 0 — training shape function phi ({args.shape_fn_epochs} epochs) ...")
+        train_shape_fn(dynamics.V.phi, data,
+                       epochs=args.shape_fn_epochs,
+                       lr=args.shape_fn_lr)
+        if not args.no_plot:
+            phi_plot_path = os.path.join(args.logdir, "phase0_shape_fn.png")
+            save_shape_fn_plot(dynamics.V.phi, data, phi_plot_path)
+
     p2a_end = args.warmup_epochs + args.lyapunov_only_epochs
+    mode_tag = 'limit_cycle' if args.limit_cycle else 'icnn'
     print(f"\nTraining for {args.epochs} epochs ...")
     print(f"  1–{args.warmup_epochs}: plain NODE  |  "
-          f"{args.warmup_epochs+1}–{p2a_end}: V only (fhat frozen)  |  "
+          f"{args.warmup_epochs+1}–{p2a_end}: {mode_tag} V/phi only (fhat frozen)  |  "
           f"{p2a_end+1}–{args.epochs}: joint fine-tune")
     loss_history = train(
         dynamics, data, args.logdir,
@@ -959,6 +1199,7 @@ def main():
         warmup_epochs=args.warmup_epochs, pos_weight=args.pos_weight, vel_weight=args.vel_weight,
         use_wandb=use_wandb, icnn_lr_scale=args.icnn_lr_scale,
         eval_every=args.eval_every, lyapunov_only_epochs=args.lyapunov_only_epochs,
+        limit_cycle=args.limit_cycle,
     )
 
     torch.save({
