@@ -220,72 +220,53 @@ def load_phys_gmm(dataset='2D_snake', subsample=1, T=1000):
 # ---------------------------------------------------------------------------
 
 def train_shape_fn(phi, data, epochs=1000, lr=1e-3):
-    """Phase 0: learn phi(x)=0 on demo trajectories.
+    """Phase 0: learn phi(x)=0 on demo trajectories via the polar parameterization.
 
-    PolarLimitCycleShapeFn guarantees a closed zero set by construction, so
-    no eikonal regularizer is needed — the on-curve loss alone is sufficient.
+    PolarLimitCycleShapeFn guarantees a closed zero set by construction, so no
+    eikonal regularizer is needed — the on-curve loss alone is sufficient.
     """
     device  = next(phi.parameters()).device
-    pos     = data['pos']                              # (N, T, d)
-    x_curve = pos.reshape(-1, pos.shape[-1])           # (N*T, d) — points on the cycle
+    pos     = data['pos']
+    x_curve = pos.reshape(-1, pos.shape[-1]).to(device)
 
     opt  = torch.optim.Adam(phi.parameters(), lr=lr)
-    pbar = tqdm(range(epochs), desc="Shape fn (phi)", dynamic_ncols=True)
+    pbar = tqdm(range(epochs), desc="Phase 0 — phi", dynamic_ncols=True)
     for ep in pbar:
         loss = phi(x_curve).pow(2).mean()
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-
+        opt.zero_grad(); loss.backward(); opt.step()
         if ep % 100 == 0 or ep == epochs - 1:
             pbar.set_postfix(loss=f"{loss.item():.6f}")
 
-    tqdm.write(f"  phi training done — on-curve |phi|.mean = {phi(x_curve).abs().mean().item():.6f}")
+    tqdm.write(f"  phi done — |phi(demo)|.mean = {phi(x_curve).abs().mean().item():.6f}")
 
 
 def save_shape_fn_plot(phi, data, save_path, lim=1.3, grid_n=300):
-    """Visualize the learned polar shape function phi after Phase 0.
-
-    Four panels:
-      1. phi(x) signed heatmap — blue inside cycle, red outside; white line = phi=0.
-      2. |phi(x)| — distance-like to the cycle; dark band = the cycle itself.
-      3. r(theta) polar plot — the learned radius function; directly shows the
-         closed curve shape in polar coordinates around the centroid.
-      4. Overlay — demo trajectories vs learned phi=0 contour in Cartesian space.
-    """
+    """Visualize the learned polar shape function after Phase 0."""
     import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
 
     device = next(phi.parameters()).device
     phi.eval()
 
-    # Cartesian grid evaluation
     xs     = torch.linspace(-lim, lim, grid_n, device=device)
     XX, YY = torch.meshgrid(xs, xs, indexing='xy')
     grid   = torch.stack([XX.ravel(), YY.ravel()], dim=1)
     with torch.no_grad():
-        phi_vals = phi(grid)                         # (N, 1)
-    phi_np  = phi_vals.cpu().numpy().reshape(grid_n, grid_n)
-    xs_np   = xs.cpu().numpy()
+        phi_np = phi(grid).cpu().numpy().reshape(grid_n, grid_n)
+    xs_np = xs.cpu().numpy()
 
-    # Polar r(theta) evaluation
     theta_np = np.linspace(0, 2 * np.pi, 720)
-    cos_sin  = torch.tensor(
-        np.stack([np.cos(theta_np), np.sin(theta_np)], axis=1), dtype=torch.float32, device=device
-    )
+    cos_sin  = torch.tensor(np.stack([np.cos(theta_np), np.sin(theta_np)], axis=1),
+                            dtype=torch.float32, device=device)
     with torch.no_grad():
-        r_vals = phi.r_net(cos_sin).cpu().numpy().ravel()   # (720,)
-
-    # Cartesian coords of the learned cycle from polar parameterization
+        r_vals = phi.r_net(cos_sin).cpu().numpy().ravel()
     cycle_x = r_vals * np.cos(theta_np)
     cycle_y = r_vals * np.sin(theta_np)
-
-    pos_gt = data['pos'].cpu().numpy()               # (N_demo, T, 2)
+    pos_gt  = data['pos'].cpu().numpy()
 
     fig = plt.figure(figsize=(22, 6))
     gs  = fig.add_gridspec(1, 4, wspace=0.35)
 
-    # --- Panel 1: signed phi heatmap ---
     ax = fig.add_subplot(gs[0])
     vabs = float(np.abs(phi_np).max())
     norm = mcolors.TwoSlopeNorm(vmin=-vabs, vcenter=0.0, vmax=vabs)
@@ -296,43 +277,38 @@ def save_shape_fn_plot(phi, data, save_path, lim=1.3, grid_n=300):
                 label='Demo' if i == 0 else None)
     ax.scatter(0, 0, c='yellow', s=60, zorder=5, label='centroid')
     fig.colorbar(cf, ax=ax, label='phi(x)', shrink=0.85)
-    ax.set_aspect('equal'); ax.set_title('phi(x)\n[white = phi=0 cycle]')
+    ax.set_aspect('equal'); ax.set_title('phi(x)  [white = phi=0]')
     ax.legend(fontsize=7, loc='lower right')
     ax.set_xlabel('$x_1$'); ax.set_ylabel('$x_2$')
 
-    # --- Panel 2: |phi| heatmap ---
     ax = fig.add_subplot(gs[1])
     cf2 = ax.contourf(xs_np, xs_np, np.abs(phi_np), levels=60, cmap='viridis', alpha=0.85)
     ax.contour(xs_np, xs_np, phi_np, levels=[0.0], colors='white', linewidths=2.0)
     for i in range(pos_gt.shape[0]):
         ax.plot(pos_gt[i, :, 0], pos_gt[i, :, 1], c='lime', linewidth=1.2, alpha=0.8)
     fig.colorbar(cf2, ax=ax, label='|phi(x)|', shrink=0.85)
-    ax.set_aspect('equal'); ax.set_title('|phi(x)|  = sqrt(V_lc)\n[dark band = on cycle]')
+    ax.set_aspect('equal'); ax.set_title('|phi(x)|  [dark band = on cycle]')
     ax.set_xlabel('$x_1$'); ax.set_ylabel('$x_2$')
 
-    # --- Panel 3: r(theta) polar plot ---
     ax = fig.add_subplot(gs[2], projection='polar')
-    ax.plot(theta_np, r_vals, c='crimson', linewidth=2.0, label='r(theta)')
+    ax.plot(theta_np, r_vals, c='crimson', linewidth=2.0)
     ax.fill(theta_np, r_vals, alpha=0.15, color='crimson')
-    ax.set_title('r(theta) — learned radius\n[closed by construction]', pad=18)
-    ax.set_rlabel_position(45)
+    ax.set_title('r(theta) — learned radius', pad=18)
 
-    # --- Panel 4: Cartesian overlay ---
     ax = fig.add_subplot(gs[3])
     for i in range(pos_gt.shape[0]):
         ax.plot(pos_gt[i, :, 0], pos_gt[i, :, 1], c='dodgerblue', linewidth=1.5, alpha=0.8,
                 label='Demo' if i == 0 else None)
-    ax.plot(cycle_x, cycle_y, c='crimson', linewidth=2.0, label='phi=0 (polar)')
+    ax.plot(cycle_x, cycle_y, c='crimson', linewidth=2.0, label='phi=0')
     ax.scatter(0, 0, c='black', s=60, zorder=5, label='centroid')
-    ax.set_aspect('equal'); ax.set_title('Demo vs learned cycle\n[Cartesian overlay]')
+    ax.set_aspect('equal'); ax.set_title('Demo vs learned cycle')
     ax.legend(fontsize=7, loc='lower right')
     ax.set_xlabel('$x_1$'); ax.set_ylabel('$x_2$')
 
-    fig.suptitle('Phase 0 — Learned Polar Shape Function phi(x) = ||x|| - r(theta)',
-                 fontsize=13)
+    fig.suptitle('Phase 0 — phi(x) = ||x|| - r(theta)', fontsize=13)
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
-    print(f"Shape function plot saved to {save_path}")
+    print(f"Shape fn plot saved to {save_path}")
     phi.train()
 
 
@@ -341,7 +317,7 @@ def build_model(hidden_dim=256, alpha=0.1, stability_mode='off', eps=1.0, d=1.0,
     fhat = MLP(in_dim=dim, out_dim=dim, hidden_dim=256, num_layers=5)
     if limit_cycle:
         phi = PolarLimitCycleShapeFn(hidden=phi_hidden)
-        V   = LimitCycleV(phi)
+        V   = LimitCycleV(phi, eps=eps, d=d)
     else:
         icnn = ICNN([dim, hidden_dim, hidden_dim, hidden_dim, hidden_dim, 1])
         V    = MakePSD(icnn, n=dim, eps=eps, d=d)
@@ -388,7 +364,7 @@ def _draw_streamplot(ax, x_np, y_np, U, V_f):
     ax.set_aspect('equal'); ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$")
 
 
-def _draw_lyapunov_cf(ax, x_np, y_np, V_lyap, gamma=0.4):
+def _draw_lyapunov_cf(ax, x_np, y_np, V_lyap, gamma=0.4, is_lc=False, phi_grid=None):
     """Draw Lyapunov contourf onto ax; return cf for colorbar attachment."""
     from matplotlib.colors import PowerNorm
     vmax = V_lyap.max()
@@ -398,8 +374,15 @@ def _draw_lyapunov_cf(ax, x_np, y_np, V_lyap, gamma=0.4):
     ax.contour(x_np, y_np, V_lyap, levels=levels[::8], colors='white', linewidths=0.4, alpha=0.4)
     ax.axhline(0, color='w', linewidth=0.5, alpha=0.5)
     ax.axvline(0, color='w', linewidth=0.5, alpha=0.5)
-    ax.plot(0.0, 0.0, 'ro', markersize=8, markeredgecolor='white', markeredgewidth=1.0,
-            zorder=6, label='V=0')
+    if is_lc and phi_grid is not None:
+        # phi=0 is the exact learned limit cycle
+        ax.contour(x_np, y_np, phi_grid, levels=[0.0], colors='lime',
+                   linewidths=2.0, zorder=6)
+        from matplotlib.lines import Line2D
+        ax.add_artist(Line2D([0], [0], color='lime', linewidth=2, label='Limit cycle (phi=0)'))
+    else:
+        ax.plot(0.0, 0.0, 'ro', markersize=8, markeredgecolor='white', markeredgewidth=1.0,
+                zorder=6, label='V=0')
     ax.set_xlim(x_np[0], x_np[-1]); ax.set_ylim(y_np[0], y_np[-1])
     return cf
 
@@ -420,7 +403,7 @@ def _draw_lyapunov(fig, ax, x_np, y_np, V_lyap):
     ax.set_aspect('equal'); ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$")
 
 
-def _draw_lyapunov_surface_3d(ax, x_np, y_np, V_lyap, U=None, V_f=None):
+def _draw_lyapunov_surface_3d(ax, x_np, y_np, V_lyap, U=None, V_f=None, is_lc=False, phi_grid=None):
     """3D surface plot of V(x1, x2) with floor contours and f(x) arrow.
 
     _compute_grid uses torch indexing='xy': V_lyap[row, col] = V(x_np[col], y_np[row]).
@@ -464,12 +447,18 @@ def _draw_lyapunov_surface_3d(ax, x_np, y_np, V_lyap, U=None, V_f=None):
         ax.text(px + dx * 1.5, py + dy * 1.5, pv + (vmax - vmin) * 0.06,
                 r'$f(x)$', color='white', fontsize=10, zorder=9)
 
-    # Attractor at origin
-    ax.scatter([0], [0], [vmin], c='red', s=80, zorder=10)
+    if is_lc and phi_grid is not None:
+        # phi=0 is the exact learned limit cycle — draw it on the floor
+        ax.contour(XX, YY, phi_grid, levels=[0.0], colors='lime',
+                   linewidths=2.0, alpha=0.9, zdir='z', offset=vmin)
+    elif is_lc:
+        pass  # no phi_grid available, skip floor marker
+    else:
+        ax.scatter([0], [0], [vmin], c='red', s=80, zorder=10)
 
     ax.set_zlim(vmin, vmax)
-    ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$"); ax.set_zlabel("$\ln(1+V)$")
-    ax.set_title("Lyapunov $V(x)$")
+    ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$"); ax.set_zlabel("$V^{0.4}$")
+    ax.set_title("Lyapunov $V(x)$" if not is_lc else "Lyapunov $V_{lc}(x)$")
     # elev=30 shows depth; azim=-60 (near default) shows both axes clearly
     ax.view_init(elev=30, azim=-60)
     return surf
@@ -496,7 +485,7 @@ def _draw_dotv(fig, ax, x_np, y_np, dotV):
 
 def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.02,
                      grid_data=None, probe_grid_n=8, probe_lim=1.2,
-                     lyap_data=None, fig=None, show_probe=False):
+                     lyap_data=None, fig=None, show_probe=False, phi_grid=None):
     """
     Reference-style panel:
       - Optional Lyapunov contourf as bottom layer (if lyap_data provided)
@@ -514,9 +503,10 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.02,
     target   = data.get('attractor', pos_gt[0, -1])
 
     # Lyapunov contourf as bottom layer
+    is_lc = getattr(dynamics, 'stability_mode', '') == 'limit_cycle'
     if lyap_data is not None:
         x_np_l, y_np_l, V_lyap = lyap_data
-        cf = _draw_lyapunov_cf(ax, x_np_l, y_np_l, V_lyap)
+        cf = _draw_lyapunov_cf(ax, x_np_l, y_np_l, V_lyap, is_lc=is_lc, phi_grid=phi_grid)
         if fig is not None:
             _attach_colorbar(fig, ax, cf)
 
@@ -552,31 +542,37 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.02,
                     markeredgecolor='white', markeredgewidth=0.5,
                     alpha=alpha, zorder=6, linestyle='none')
 
-    is_lc = getattr(dynamics, 'stability_mode', '') == 'limit_cycle'
-    max_chunks = max(15 if is_lc else 1, int(np.ceil(5 * pos_gt.shape[1] / len(t_eval))))
-    x_pred_np = rollout_to_convergence(dynamics, x0_batch, t_eval,
-                                       max_chunks=max_chunks).cpu().numpy()
-    for i in range(x_pred_np.shape[0]):
-        ax.plot(x_pred_np[i, :, 0], x_pred_np[i, :, 1], c='crimson',
-                linewidth=1.5,
-                zorder=4, label='Model' if i == 0 else None)
-    _mark_endpoints(x_pred_np, 'crimson', markersize=7)
-
-    # Model rollouts from perturbed x0 (dashed, lighter)
+    # Limit cycle trajectories never converge to origin, so cap chunks lower and
+    # batch all x0s (original + perturbed) into one ODE call for GPU efficiency.
+    max_chunks = max(5 if is_lc else 1, int(np.ceil(5 * pos_gt.shape[1] / len(t_eval))))
     offsets = [np.array([perturb, 0.0]), np.array([0.0, perturb]),
                np.array([-perturb, 0.0]), np.array([0.0, -perturb])]
+    x0_perturb_list = [
+        (x0_batch + torch.tensor(off, dtype=torch.float32,
+                                  device=x0_batch.device)).clamp(-1.2, 1.2)
+        for off in offsets
+    ]
+    # Single batched ODE call: [original; perturbed_0; perturbed_1; ...]
+    x0_all = torch.cat([x0_batch] + x0_perturb_list, dim=0)  # (N*(1+n_off), d)
+    all_traj_np = rollout_to_convergence(dynamics, x0_all, t_eval,
+                                         max_chunks=max_chunks).cpu().numpy()
+    N = x0_batch.shape[0]
+    x_pred_np    = all_traj_np[:N]           # original
+    x_perturb_np = all_traj_np[N:]           # perturbed, shape (N*n_off, T_total, d)
+
+    for i in range(x_pred_np.shape[0]):
+        ax.plot(x_pred_np[i, :, 0], x_pred_np[i, :, 1], c='crimson',
+                linewidth=1.5, zorder=4, label='Model' if i == 0 else None)
+    _mark_endpoints(x_pred_np, 'crimson', markersize=7)
+
+    # Perturbed rollouts (dashed, lighter)
     _perturb_labeled = False
-    for offset in offsets:
-        x0_p = (x0_batch + torch.tensor(offset, dtype=torch.float32,
-                                         device=x0_batch.device)).clamp(-1.2, 1.2)
-        x_p_np = rollout_to_convergence(dynamics, x0_p, t_eval,
-                                        max_chunks=max_chunks).cpu().numpy()
-        for i in range(x_p_np.shape[0]):
-            label = 'Perturbed' if not _perturb_labeled else None
-            _perturb_labeled = True
-            ax.plot(x_p_np[i, :, 0], x_p_np[i, :, 1], c='crimson',
-                    linewidth=0.8, linestyle='--', alpha=0.45, zorder=4, label=label)
-        _mark_endpoints(x_p_np, 'crimson', markersize=4, alpha=0.6)
+    for j in range(x_perturb_np.shape[0]):
+        label = 'Perturbed' if not _perturb_labeled else None
+        _perturb_labeled = True
+        ax.plot(x_perturb_np[j, :, 0], x_perturb_np[j, :, 1], c='crimson',
+                linewidth=0.8, linestyle='--', alpha=0.45, zorder=4, label=label)
+    _mark_endpoints(x_perturb_np, 'crimson', markersize=4, alpha=0.6)
 
     # Probe rollouts from a uniform grid to reveal spurious attractors
     if show_probe:
@@ -585,6 +581,7 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.02,
             np.stack(np.meshgrid(xs, xs), axis=-1).reshape(-1, 2),
             dtype=torch.float32, device=x0_batch.device,
         )
+        # Single batched ODE call for all probe points
         probe_np = rollout_to_convergence(dynamics, probe_x0, t_eval,
                                           max_chunks=max_chunks).cpu().numpy()
         for i in range(probe_np.shape[0]):
@@ -593,7 +590,7 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.02,
                     label='Probe' if i == 0 else None)
         _mark_endpoints(probe_np, 'darkorange', markersize=4, alpha=0.6)
 
-    # For limit cycle mode, draw the learned phi=0 contour (the limit cycle shape)
+    # For limit cycle mode, draw the phi=0 contour (the learned cycle shape)
     if getattr(dynamics, 'stability_mode', '') == 'limit_cycle':
         lim = 1.3
         N_g = 200
@@ -745,7 +742,7 @@ def _make_figure(dynamics, data, t_eval, title_suffix, fig_kw):
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-    if dynamics.stability_mode != 'icnn':
+    if dynamics.stability_mode not in ('icnn', 'limit_cycle'):
         # Warmup: skip V evaluation entirely
         x_np, y_np, U, V_f, _, _ = _compute_grid(dynamics)
         fig, ax = plt.subplots(figsize=(7, 7), **fig_kw)
@@ -755,10 +752,24 @@ def _make_figure(dynamics, data, t_eval, title_suffix, fig_kw):
         fig.tight_layout()
         return fig
 
+    is_lc = (dynamics.stability_mode == 'limit_cycle')
     x_np, y_np, U, V_f, V_lyap, dotV = _compute_grid(dynamics)
     grid_data = (x_np, y_np, U, V_f)
     lyap_data  = (x_np, y_np, V_lyap)
 
+    # Compute phi=0 grid for limit cycle contour overlays
+    if is_lc and hasattr(dynamics.V, 'phi'):
+        device = next(dynamics.parameters()).device
+        N_g, lim_g = 41, 1.2
+        xs_g = torch.linspace(-lim_g, lim_g, N_g, device=device)
+        XX_g, YY_g = torch.meshgrid(xs_g, xs_g, indexing='xy')
+        grid_g = torch.stack([XX_g.ravel(), YY_g.ravel()], dim=1)
+        with torch.no_grad():
+            phi_grid = dynamics.V.phi(grid_g).reshape(N_g, N_g).cpu().numpy()
+    else:
+        phi_grid = None
+
+    v_label = '$V_{lc}(x)$' if is_lc else '$V(x)$'
     fig = plt.figure(figsize=(28, 7), **fig_kw)
 
     # Panel 1: vector field + rollouts (2D)
@@ -769,21 +780,22 @@ def _make_figure(dynamics, data, t_eval, title_suffix, fig_kw):
 
     # Panel 2: Lyapunov 3D surface
     ax2 = fig.add_subplot(1, 4, 2, projection='3d')
-    surf = _draw_lyapunov_surface_3d(ax2, x_np, y_np, V_lyap, U=U, V_f=V_f)
-    ax2.set_title(f"Lyapunov $V(x)$ {title_suffix}", pad=12)
-    fig.colorbar(surf, ax=ax2, shrink=0.55, pad=0.1, label='$V(x)$')
+    surf = _draw_lyapunov_surface_3d(ax2, x_np, y_np, V_lyap, U=U, V_f=V_f,
+                                     is_lc=is_lc, phi_grid=phi_grid)
+    ax2.set_title(f"{v_label} {title_suffix}", pad=12)
+    fig.colorbar(surf, ax=ax2, shrink=0.55, pad=0.1, label=v_label)
 
     # Panel 3: dV/dt heatmap (2D)
     ax3 = fig.add_subplot(1, 4, 3)
     _draw_dotv(fig, ax3, x_np, y_np, dotV)
     ax3.set_title(r"$\dot V = \nabla V \cdot f$ " + title_suffix)
 
-    # Panel 4: combined overlay (2D)
+    # Panel 4: combined overlay (2D): Lyapunov contourf + streamplot + rollouts
     ax4 = fig.add_subplot(1, 4, 4)
     _plot_traj_panel(ax4, data, dynamics, t_eval,
                      title=f"Combined {title_suffix}",
                      grid_data=grid_data,
-                     lyap_data=lyap_data, fig=fig)
+                     lyap_data=lyap_data, fig=fig, phi_grid=phi_grid)
 
     fig.tight_layout()
     return fig
@@ -977,8 +989,7 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
         clip_grad_norm_(dynamics.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
-        # Cache invalidation only needed when ICNN V is active
-        if dynamics.stability_mode == 'icnn':
+        if dynamics.stability_mode in ('icnn', 'limit_cycle'):
             dynamics.V.invalidate_zero_cache()
 
         loss_history.append(loss.item())
@@ -1085,17 +1096,17 @@ def main():
                         help="MakePSD quadratic floor coefficient (smaller → V less quadratic)")
     parser.add_argument("--d",              type=float, default=1e-5,
                         help="ReHU knee point in MakePSD (smaller → ICNN activates closer to origin)")
-    parser.add_argument("--limit_cycle",    action="store_true",
-                        help="Enable limit-cycle mode: learn phi(x)=0 on curve, use V_lc=phi^2")
-    parser.add_argument("--center_mode",    type=str,   default='endpoint',
+    parser.add_argument("--limit_cycle",      action="store_true",
+                        help="Enable limit-cycle mode: V_lc = ReHU_d(phi^2) + eps*||x||^2")
+    parser.add_argument("--center_mode",      type=str,   default='endpoint',
                         choices=['endpoint', 'centroid'],
                         help="IROS centering: 'endpoint' (default) or 'centroid' (required for limit_cycle)")
-    parser.add_argument("--shape_fn_epochs", type=int,  default=1000,
-                        help="Epochs for phase-0 shape function (phi) training")
-    parser.add_argument("--shape_fn_lr",   type=float, default=1e-3,
-                        help="Learning rate for phi training")
-    parser.add_argument("--phi_hidden",    type=int,   default=64,
-                        help="Hidden dim of PolarLimitCycleShapeFn r_net MLP")
+    parser.add_argument("--shape_fn_epochs",  type=int,   default=1000,
+                        help="Phase-0 epochs to train the polar shape function phi")
+    parser.add_argument("--shape_fn_lr",      type=float, default=1e-3,
+                        help="Learning rate for Phase-0 phi training")
+    parser.add_argument("--phi_hidden",       type=int,   default=64,
+                        help="Hidden dim of PolarLimitCycleShapeFn r_net")
     parser.add_argument("--no_plot",        action="store_true")
     parser.add_argument("--wandb_project",  type=str,   default="stable-nodes",
                         help="W&B project name")
@@ -1177,15 +1188,14 @@ def main():
     if use_wandb:
         wandb.config.update({"n_params": n_params, "device": str(device)})
 
-    # Phase 0 (limit cycle only): learn shape function phi before dynamics training
+    # Phase 0 (limit cycle only): train phi so phi(x_demo)=0 before dynamics training
     if args.limit_cycle:
-        print(f"\nPhase 0 — training shape function phi ({args.shape_fn_epochs} epochs) ...")
+        print(f"\nPhase 0 — training shape fn phi ({args.shape_fn_epochs} epochs) ...")
         train_shape_fn(dynamics.V.phi, data,
-                       epochs=args.shape_fn_epochs,
-                       lr=args.shape_fn_lr)
+                       epochs=args.shape_fn_epochs, lr=args.shape_fn_lr)
         if not args.no_plot:
-            phi_plot_path = os.path.join(args.logdir, "phase0_shape_fn.png")
-            save_shape_fn_plot(dynamics.V.phi, data, phi_plot_path)
+            save_shape_fn_plot(dynamics.V.phi, data,
+                               os.path.join(args.logdir, "phase0_shape_fn.png"))
 
     p2a_end = args.warmup_epochs + args.lyapunov_only_epochs
     mode_tag = 'limit_cycle' if args.limit_cycle else 'icnn'
