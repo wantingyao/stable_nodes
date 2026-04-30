@@ -31,7 +31,7 @@ def rollout(dynamics, x0_batch, t, method='rk4'):
         x_pred    : (N, T, d) predicted trajectories
     """
     ode_fn = make_ode_fn(dynamics)
-    out = odeint(ode_fn, x0_batch, t, method=method, options={'max_num_steps': 2000})
+    out = odeint(ode_fn, x0_batch, t, method=method)
     # odeint returns (T, N, d) → (N, T, d)
     return out.permute(1, 0, 2)
 

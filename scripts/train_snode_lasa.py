@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(repo, "utils"))
 sys.path.insert(0, os.path.join(repo, "src"))   # must be first: shadows utils/node.py
 
 from node import MLP, rollout, rollout_to_convergence
-from lsddm import Dynamics, ICNN, MakePSD, PolarLimitCycleShapeFn, LimitCycleV
+from lsddm import Dynamics, ICNN, MakePSD, WarpedMakePSD, RadialWarp, ICNNLimitCycleV
 
 
 # ---------------------------------------------------------------------------
@@ -313,15 +313,19 @@ def save_shape_fn_plot(phi, data, save_path, lim=1.3, grid_n=300):
 
 
 def build_model(hidden_dim=256, alpha=0.1, stability_mode='off', eps=1.0, d=1.0, dim=2,
-                limit_cycle=False, phi_hidden=64):
+                limit_cycle=False, eps_smooth=0.05, flow_layers=0, flow_hidden=64, clf_d=0.1):
     fhat = MLP(in_dim=dim, out_dim=dim, hidden_dim=256, num_layers=5)
     if limit_cycle:
-        phi = PolarLimitCycleShapeFn(hidden=phi_hidden)
-        V   = LimitCycleV(phi, eps=eps, d=d)
+        icnn = ICNN([dim, hidden_dim, hidden_dim, hidden_dim, hidden_dim, 1])
+        V    = ICNNLimitCycleV(icnn, v_gamma_init=1.0, eps_smooth=eps_smooth)
+    elif flow_layers > 0:
+        icnn = ICNN([dim, hidden_dim, hidden_dim, hidden_dim, hidden_dim, 1])
+        flow = RadialWarp(n_basis=flow_hidden)
+        V    = WarpedMakePSD(icnn, flow, n=dim, eps=eps, d=d)
     else:
         icnn = ICNN([dim, hidden_dim, hidden_dim, hidden_dim, hidden_dim, 1])
         V    = MakePSD(icnn, n=dim, eps=eps, d=d)
-    dynamics = Dynamics(fhat, V, alpha=alpha, stability_mode=stability_mode)
+    dynamics = Dynamics(fhat, V, alpha=alpha, stability_mode=stability_mode, clf_d=clf_d)
     return dynamics
 
 
@@ -355,9 +359,9 @@ def _compute_grid(dynamics, N=41, lim=1.2):
 
 
 def _draw_streamplot(ax, x_np, y_np, U, V_f):
-    """Violet streamplot matching PShape_2.png reference style."""
+    """Violet streamplot."""
     ax.streamplot(x_np, y_np, U, V_f,
-                  color='mediumorchid', linewidth=0.6, arrowsize=0.7, density=2.0)
+                  color='mediumorchid', linewidth=0.6, arrowsize=0.7, density=1.2)
     ax.axhline(0, color='k', linewidth=0.4, alpha=0.4)
     ax.axvline(0, color='k', linewidth=0.4, alpha=0.4)
     ax.set_xlim(x_np[0], x_np[-1]); ax.set_ylim(y_np[0], y_np[-1])
@@ -368,10 +372,10 @@ def _draw_lyapunov_cf(ax, x_np, y_np, V_lyap, gamma=0.4, is_lc=False, phi_grid=N
     """Draw Lyapunov contourf onto ax; return cf for colorbar attachment."""
     from matplotlib.colors import PowerNorm
     vmax = V_lyap.max()
-    levels = np.concatenate([[0.0], np.geomspace(vmax * 1e-3, vmax, 79)])
+    levels = np.concatenate([[0.0], np.geomspace(vmax * 1e-3, vmax, 20)])
     norm = PowerNorm(gamma=gamma, vmin=0.0, vmax=vmax)
-    cf = ax.contourf(x_np, y_np, V_lyap, levels=levels, cmap='viridis', alpha=0.80, norm=norm)
-    ax.contour(x_np, y_np, V_lyap, levels=levels[::8], colors='white', linewidths=0.4, alpha=0.4)
+    cf = ax.contourf(x_np, y_np, V_lyap, levels=levels, cmap='viridis', alpha=0.75, norm=norm)
+    ax.contour(x_np, y_np, V_lyap, levels=levels[::4], colors='white', linewidths=0.4, alpha=0.4)
     ax.axhline(0, color='w', linewidth=0.5, alpha=0.5)
     ax.axvline(0, color='w', linewidth=0.5, alpha=0.5)
     if is_lc and phi_grid is not None:
@@ -545,8 +549,7 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.02,
     # Limit cycle trajectories never converge to origin, so cap chunks lower and
     # batch all x0s (original + perturbed) into one ODE call for GPU efficiency.
     max_chunks = max(5 if is_lc else 1, int(np.ceil(5 * pos_gt.shape[1] / len(t_eval))))
-    offsets = [np.array([perturb, 0.0]), np.array([0.0, perturb]),
-               np.array([-perturb, 0.0]), np.array([0.0, -perturb])]
+    offsets = [np.array([perturb, 0.0]), np.array([-perturb, 0.0])]
     x0_perturb_list = [
         (x0_batch + torch.tensor(off, dtype=torch.float32,
                                   device=x0_batch.device)).clamp(-1.2, 1.2)
@@ -590,7 +593,7 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.02,
                     label='Probe' if i == 0 else None)
         _mark_endpoints(probe_np, 'darkorange', markersize=4, alpha=0.6)
 
-    # For limit cycle mode, draw the phi=0 contour (the learned cycle shape)
+    # For limit cycle mode, draw the learned cycle boundary as a contour
     if getattr(dynamics, 'stability_mode', '') == 'limit_cycle':
         lim = 1.3
         N_g = 200
@@ -599,10 +602,19 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.02,
         XX, YY = torch.meshgrid(xs, xs, indexing='xy')
         grid = torch.stack([XX.ravel(), YY.ravel()], dim=1)
         with torch.no_grad():
-            phi_grid = dynamics.V.phi(grid).reshape(N_g, N_g).cpu().numpy()
-        ax.contour(xs.cpu().numpy(), xs.cpu().numpy(), phi_grid,
-                   levels=[0.0], colors='white', linewidths=1.5, linestyles='--',
-                   zorder=5)
+            if hasattr(dynamics.V, 'phi'):
+                cycle_grid = dynamics.V.phi(grid).reshape(N_g, N_g).cpu().numpy()
+                levels = [0.0]
+            elif hasattr(dynamics.V, 'icnn'):
+                v_gamma = dynamics.V.v_gamma.item()
+                cycle_grid = (dynamics.V.icnn(grid) - v_gamma).reshape(N_g, N_g).cpu().numpy()
+                levels = [0.0]
+            else:
+                cycle_grid = None
+        if cycle_grid is not None:
+            ax.contour(xs.cpu().numpy(), xs.cpu().numpy(), cycle_grid,
+                       levels=levels, colors='white', linewidths=1.5, linestyles='--',
+                       zorder=5)
 
     ax.set_aspect('equal'); ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$")
     ax.set_title(title)
@@ -757,17 +769,20 @@ def _make_figure(dynamics, data, t_eval, title_suffix, fig_kw):
     grid_data = (x_np, y_np, U, V_f)
     lyap_data  = (x_np, y_np, V_lyap)
 
-    # Compute phi=0 grid for limit cycle contour overlays
-    if is_lc and hasattr(dynamics.V, 'phi'):
+    # Compute cycle boundary grid for limit cycle contour overlays
+    phi_grid = None
+    if is_lc:
         device = next(dynamics.parameters()).device
         N_g, lim_g = 41, 1.2
         xs_g = torch.linspace(-lim_g, lim_g, N_g, device=device)
         XX_g, YY_g = torch.meshgrid(xs_g, xs_g, indexing='xy')
         grid_g = torch.stack([XX_g.ravel(), YY_g.ravel()], dim=1)
         with torch.no_grad():
-            phi_grid = dynamics.V.phi(grid_g).reshape(N_g, N_g).cpu().numpy()
-    else:
-        phi_grid = None
+            if hasattr(dynamics.V, 'phi'):
+                phi_grid = dynamics.V.phi(grid_g).reshape(N_g, N_g).cpu().numpy()
+            elif hasattr(dynamics.V, 'icnn'):
+                v_gamma = dynamics.V.v_gamma.item()
+                phi_grid = (dynamics.V.icnn(grid_g) - v_gamma).reshape(N_g, N_g).cpu().numpy()
 
     v_label = '$V_{lc}(x)$' if is_lc else '$V(x)$'
     fig = plt.figure(figsize=(28, 7), **fig_kw)
@@ -801,15 +816,17 @@ def _make_figure(dynamics, data, t_eval, title_suffix, fig_kw):
     return fig
 
 
-def save_intermediate_plot(dynamics, data, t_eval, epoch, logdir, dtwd=None, use_wandb=False):
+def save_intermediate_plot(dynamics, data, t_eval, epoch, logdir, dtwd=None, conv_mse=None, use_wandb=False):
     """Save plot every eval_every epochs (2D: streamplot; 3D: trajectory axes)."""
     import matplotlib.pyplot as plt
     dynamics.eval()
 
     dim = data.get('dim', data['pos'].shape[-1])
-    dtwd_tag = f"_dtwd_{dtwd:.4f}" if dtwd is not None else ""
+    dtwd_tag    = f"_dtwd_{dtwd:.4f}"       if dtwd     is not None else ""
+    convmse_tag = f"_convmse_{conv_mse:.4f}" if conv_mse is not None else ""
     title_suffix = (f"— Epoch {epoch}  [{dynamics.stability_mode}]"
-                    + (f"  DTWD={dtwd:.4f}" if dtwd is not None else ""))
+                    + (f"  DTWD={dtwd:.4f}" if dtwd is not None else "")
+                    + (f"  ConvMSE={conv_mse:.4f}" if conv_mse is not None else ""))
     if dim == 3:
         fig = _make_figure_3d(dynamics, data, t_eval, title_suffix=title_suffix, fig_kw={})
     else:
@@ -817,7 +834,7 @@ def save_intermediate_plot(dynamics, data, t_eval, epoch, logdir, dtwd=None, use
     fig.tight_layout()
     vis_dir = os.path.join(logdir, "vis")
     os.makedirs(vis_dir, exist_ok=True)
-    fig_path = os.path.join(vis_dir, f"epoch_{epoch:04d}{dtwd_tag}.png")
+    fig_path = os.path.join(vis_dir, f"epoch_{epoch:04d}{dtwd_tag}{convmse_tag}.png")
     fig.savefig(fig_path, dpi=120)
     if use_wandb and _WANDB_AVAILABLE:
         wandb.log({"vis/trajectory": wandb.Image(fig_path)}, step=epoch)
@@ -859,7 +876,7 @@ def _dtw_distance(p: np.ndarray, q: np.ndarray) -> float:
 
 
 @torch.no_grad()
-def evaluate(dynamics, data, solver='dopri5') -> dict:
+def evaluate(dynamics, data, solver='rk4') -> dict:
     """Compute RMSE_vel, MVD, and DTWD on the LASA demos.
 
     - RMSE_vel / MVD: computed at GT trajectory positions (independent of rollout).
@@ -890,7 +907,11 @@ def evaluate(dynamics, data, solver='dopri5') -> dict:
                  for i in range(N)]
     dtwd = float(np.mean(dtwd_vals))
 
-    return {'rmse_vel': rmse_vel, 'mvd': mvd, 'dtwd': dtwd}
+    # MSE of final position from attractor (origin)
+    x_final  = x_pred[:, -1, :]                              # (N, d)
+    conv_mse = x_final.pow(2).sum(dim=-1).mean().item()      # mean ||x_T||²
+
+    return {'rmse_vel': rmse_vel, 'mvd': mvd, 'dtwd': dtwd, 'conv_mse': conv_mse}
 
 
 # ---------------------------------------------------------------------------
@@ -900,7 +921,7 @@ def evaluate(dynamics, data, solver='dopri5') -> dict:
 def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
           warmup_epochs=200, pos_weight=1.0, vel_weight=1.0, use_wandb=False,
           icnn_lr_scale=0.1, eval_every=100, lyapunov_only_epochs=200,
-          limit_cycle=False):
+          limit_cycle=False, levelset_weight=1.0):
     """Three-phase training.
 
     Standard (limit_cycle=False):
@@ -951,21 +972,22 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=remaining, eta_min=phase2_lr * 0.1
             )
-            solver = 'dopri5'
             tqdm.write(f"\n[Epoch {epoch}] Phase 2a — {phase2_mode} V/phi only (fhat frozen), lr={phase2_lr:.2e}")
 
-        # Phase 2a → 2b: unfreeze fhat, joint fine-tuning
+        # Phase 2a → 2b: unfreeze fhat, joint fine-tuning with separate LR groups
         if epoch == phase2b_start:
             for p in dynamics.fhat.parameters():
                 p.requires_grad_(True)
-            optimizer = torch.optim.Adam(
-                dynamics.parameters(), lr=phase2_lr, weight_decay=weight_decay,
-            )
+            optimizer = torch.optim.Adam([
+                {'params': dynamics.fhat.parameters(), 'lr': phase2_lr},
+                {'params': dynamics.V.parameters(),    'lr': phase2_lr * 0.1},
+            ], weight_decay=weight_decay)
             remaining2b = num_epochs - phase2b_start + 1
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=max(remaining2b, 1), eta_min=phase2_lr * 0.1
+                optimizer, T_max=max(remaining2b, 1), eta_min=phase2_lr * 0.01
             )
-            tqdm.write(f"\n[Epoch {epoch}] Phase 2b — joint fine-tuning (all params)")
+            tqdm.write(f"\n[Epoch {epoch}] Phase 2b — joint fine-tuning "
+                       f"(fhat lr={phase2_lr:.2e}, V lr={phase2_lr*0.1:.2e})")
 
         dynamics.train()
         optimizer.zero_grad()
@@ -984,6 +1006,12 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
         loss_vel = F.mse_loss(vel_pred, vel_gt)
 
         loss = pos_weight * loss_pos + vel_weight * loss_vel
+
+        if (dynamics.stability_mode == 'limit_cycle'
+                and levelset_weight > 0.0
+                and hasattr(dynamics.V, 'level_set_loss')):
+            x_demo_flat = pos_gt[:, :-1, :].reshape(-1, d).detach()
+            loss = loss + levelset_weight * dynamics.V.level_set_loss(x_demo_flat)
 
         loss.backward()
         clip_grad_norm_(dynamics.parameters(), max_norm=1.0)
@@ -1010,9 +1038,11 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
             tqdm.write(
                 f"[Epoch {epoch:>5}]  RMSE_vel={metrics['rmse_vel']:.6f}"
                 f"  MVD={metrics['mvd']:.6f}  DTWD={dtwd_str}"
+                f"  ConvMSE={metrics['conv_mse']:.6f}"
             )
             if use_wandb and _WANDB_AVAILABLE:
-                log_d = {"eval/rmse_vel": metrics['rmse_vel'], "eval/mvd": metrics['mvd']}
+                log_d = {"eval/rmse_vel": metrics['rmse_vel'], "eval/mvd": metrics['mvd'],
+                         "eval/conv_mse": metrics['conv_mse']}
                 if not (metrics['dtwd'] != metrics['dtwd']):
                     log_d["eval/dtwd"] = metrics['dtwd']
                 wandb.log(log_d, step=epoch)
@@ -1031,9 +1061,10 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
 
                 # Save periodic checkpoint every 200 epochs after warmup
                 epochs_since_warmup = epoch - warmup_epochs
+                conv_mse = metrics['conv_mse']
                 if epochs_since_warmup % 200 == 0 or epoch == num_epochs:
                     ckpt_path = os.path.join(
-                        logdir, f"ckpt_ep{epoch:04d}_{best_metric_tag}_{best_metric:.4f}.pt"
+                        logdir, f"ckpt_ep{epoch:04d}_{best_metric_tag}_{best_metric:.4f}_convmse_{conv_mse:.4f}.pt"
                     )
                     torch.save(ckpt, ckpt_path)
                     tqdm.write(f"  → {os.path.basename(ckpt_path)} saved")
@@ -1044,13 +1075,14 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
                     if best_path is not None and os.path.exists(best_path):
                         os.remove(best_path)
                     best_path = os.path.join(
-                        logdir, f"best_model_ep{epoch:04d}_{best_metric_tag}_{best_dtwd:.4f}.pt"
+                        logdir, f"best_model_ep{epoch:04d}_{best_metric_tag}_{best_dtwd:.4f}_convmse_{conv_mse:.4f}.pt"
                     )
                     torch.save(ckpt, best_path)
                     tqdm.write(f"  → {os.path.basename(best_path)} saved (best)")
 
             save_intermediate_plot(dynamics, data, t, epoch, logdir,
-                                   dtwd=metrics['dtwd'], use_wandb=use_wandb)
+                                   dtwd=metrics['dtwd'], conv_mse=metrics['conv_mse'],
+                                   use_wandb=use_wandb)
 
     return loss_history
 
@@ -1063,7 +1095,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train Stable NODE on 2D_messy-snake")
     parser.add_argument("--hidden_dim",    type=int,   default=64)
     parser.add_argument("--alpha",         type=float, default=0.1) # Higher alpha → stronger stability regularization (V(x) dominates over fhat(x))
-    parser.add_argument("--epochs",        type=int,   default=7000)
+    parser.add_argument("--epochs",        type=int,   default=10000)
     parser.add_argument("--lr",            type=float, default=3e-3)
     parser.add_argument("--weight_decay",  type=float, default=0.0)
     parser.add_argument("--shape",         type=str,   default='Leaf_2',
@@ -1076,11 +1108,11 @@ def main():
                         help="Weight for velocity loss term (0=disable)")
     parser.add_argument("--logdir",        type=str,   default=None,
                         help="Override experiment dir (default: logs/snode/<shape>/<datetime>)")
-    parser.add_argument("--warmup_epochs",  type=int,   default=5000,
+    parser.add_argument("--warmup_epochs",  type=int,   default=500,
                         help="Epochs with stability off (plain NODE warm-up), then ICNN projection")
     parser.add_argument("--icnn_lr_scale",        type=float, default=0.1,
                         help="LR multiplier for phase 2 (icnn), applied to both fhat and V")
-    parser.add_argument("--lyapunov_only_epochs", type=int,   default=0,
+    parser.add_argument("--lyapunov_only_epochs", type=int,   default=100,
                         help="Epochs after warmup where fhat is frozen and only V is trained (phase 2a)")
     parser.add_argument("--eval_every",      type=int,   default=100,
                         help="Run evaluation and visualization every N epochs (default: 10)")
@@ -1097,16 +1129,20 @@ def main():
     parser.add_argument("--d",              type=float, default=1e-5,
                         help="ReHU knee point in MakePSD (smaller → ICNN activates closer to origin)")
     parser.add_argument("--limit_cycle",      action="store_true",
-                        help="Enable limit-cycle mode: V_lc = ReHU_d(phi^2) + eps*||x||^2")
+                        help="Enable limit-cycle mode: V_lc = |ICNN(x) - v_gamma| (pseudo-Huber)")
     parser.add_argument("--center_mode",      type=str,   default='endpoint',
                         choices=['endpoint', 'centroid'],
                         help="IROS centering: 'endpoint' (default) or 'centroid' (required for limit_cycle)")
-    parser.add_argument("--shape_fn_epochs",  type=int,   default=1000,
-                        help="Phase-0 epochs to train the polar shape function phi")
-    parser.add_argument("--shape_fn_lr",      type=float, default=1e-3,
-                        help="Learning rate for Phase-0 phi training")
-    parser.add_argument("--phi_hidden",       type=int,   default=64,
-                        help="Hidden dim of PolarLimitCycleShapeFn r_net")
+    parser.add_argument("--eps_smooth",       type=float, default=0.05,
+                        help="Pseudo-Huber smoothing epsilon for ICNNLimitCycleV")
+    parser.add_argument("--levelset_weight",  type=float, default=1.0,
+                        help="Weight for level-set alignment loss (ICNN(x_demo) ~= v_gamma)")
+    parser.add_argument("--flow_layers",     type=int,   default=8,
+                        help="Warp enabled if >0; use 0 for plain ICNN (no radial warp)")
+    parser.add_argument("--flow_hidden",     type=int,   default=64,
+                        help="n_basis for RadialWarp MonotoneNet (more basis = more expressive s(r))")
+    parser.add_argument("--clf_d",           type=float, default=0.1,
+                        help="ReHU knee point for CLF projection (smaller → closer to ReLU, stricter guarantee)")
     parser.add_argument("--no_plot",        action="store_true")
     parser.add_argument("--wandb_project",  type=str,   default="stable-nodes",
                         help="W&B project name")
@@ -1114,7 +1150,12 @@ def main():
                         help="W&B run name (default: <shape>_<datetime>)")
     parser.add_argument("--no_wandb",       action="store_true",
                         help="Disable W&B logging")
+    parser.add_argument("--num_threads",    type=int, default=os.cpu_count(),
+                        help="PyTorch intra-op thread count (default: all cores)")
     args = parser.parse_args()
+
+    torch.set_num_threads(args.num_threads)
+    torch.set_num_interop_threads(max(1, args.num_threads // 2))
 
     use_wandb = _WANDB_AVAILABLE and not args.no_wandb
 
@@ -1181,21 +1222,15 @@ def main():
     dynamics = build_model(hidden_dim=args.hidden_dim, alpha=args.alpha,
                            stability_mode='off', eps=args.eps, d=args.d, dim=dim,
                            limit_cycle=args.limit_cycle,
-                           phi_hidden=args.phi_hidden).to(device)
+                           eps_smooth=args.eps_smooth,
+                           flow_layers=args.flow_layers,
+                           flow_hidden=args.flow_hidden,
+                           clf_d=args.clf_d).to(device)
     n_params = sum(p.numel() for p in dynamics.parameters() if p.requires_grad)
     print(f"Model: {n_params} trainable parameters")
 
     if use_wandb:
         wandb.config.update({"n_params": n_params, "device": str(device)})
-
-    # Phase 0 (limit cycle only): train phi so phi(x_demo)=0 before dynamics training
-    if args.limit_cycle:
-        print(f"\nPhase 0 — training shape fn phi ({args.shape_fn_epochs} epochs) ...")
-        train_shape_fn(dynamics.V.phi, data,
-                       epochs=args.shape_fn_epochs, lr=args.shape_fn_lr)
-        if not args.no_plot:
-            save_shape_fn_plot(dynamics.V.phi, data,
-                               os.path.join(args.logdir, "phase0_shape_fn.png"))
 
     p2a_end = args.warmup_epochs + args.lyapunov_only_epochs
     mode_tag = 'limit_cycle' if args.limit_cycle else 'icnn'
@@ -1209,7 +1244,7 @@ def main():
         warmup_epochs=args.warmup_epochs, pos_weight=args.pos_weight, vel_weight=args.vel_weight,
         use_wandb=use_wandb, icnn_lr_scale=args.icnn_lr_scale,
         eval_every=args.eval_every, lyapunov_only_epochs=args.lyapunov_only_epochs,
-        limit_cycle=args.limit_cycle,
+        limit_cycle=args.limit_cycle, levelset_weight=args.levelset_weight,
     )
 
     torch.save({
