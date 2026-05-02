@@ -21,15 +21,17 @@ SCALE_FX = False
 
 class Dynamics(nn.Module):
     # stability_mode:
-    #   'off'       — plain fhat, no projection (warm-up phase)
-    #   'quadratic' — analytical V(x)=‖x‖², ∇V=2x, no autograd
-    #   'icnn'      — learned ICNN V with torch.autograd.grad
-    def __init__(self, fhat, V, alpha=0.01, stability_mode='icnn'):
+    #   'off'          — plain fhat, no projection (warm-up phase)
+    #   'quadratic'    — analytical V(x)=‖x‖², ∇V=2x, no autograd
+    #   'icnn'         — learned ICNN V(x) with torch.autograd.grad (point attractor)
+    #   'limit_cycle'  — V(x)=phi(x)^2 via LimitCycleV; same projection, targets limit cycle
+    def __init__(self, fhat, V, alpha=0.01, stability_mode='icnn', clf_d=0.1):
         super().__init__()
         self.fhat = fhat
         self.V = V
         self.alpha = alpha
         self.stability_mode = stability_mode
+        self._clf_rehu = ReHU(clf_d)
 
     def forward(self, x):
         fx = self.fhat(x)
@@ -45,17 +47,17 @@ class Dynamics(nn.Module):
             gV   = 2.0 * x                                      # (N, d)
             dot  = (gV * fx).sum(dim=-1, keepdim=True)          # (N, 1)
             denom = (gV * gV).sum(dim=-1, keepdim=True).clamp(min=1e-12)
-            return fx - gV * F.relu(dot + self.alpha * Vx) / denom
+            return fx - gV * self._clf_rehu(dot + self.alpha * Vx) / denom
 
-        # stability_mode == 'icnn'
+        # stability_mode == 'icnn' or 'limit_cycle' — same CLF projection formula
         Vx = self.V(x)
 
-        # autograd.grad computes the gradients and returns them without
-        # populating the .grad field of the leaves of the computation graph
-        gV = torch.autograd.grad([a for a in Vx], [x], create_graph=True, only_inputs=True, allow_unused=True)[0]
+        gV = torch.autograd.grad([a for a in Vx], [x], create_graph=self.training, only_inputs=True, allow_unused=True)[0]
 
-        # Implementation of equation 10 from paper
-        rv = fx - gV * (F.relu((gV*fx).sum(dim=1) + self.alpha*Vx[:,0])/(gV**2).sum(dim=1))[:,None]
+        # Equation 10 from paper; ReHU smooths the ReLU kink at the CLF boundary.
+        denom = (gV**2).sum(dim=1).clamp(min=1e-12)
+        violation = (gV*fx).sum(dim=1) + self.alpha*Vx[:,0]
+        rv = fx - gV * (self._clf_rehu(violation) / denom)[:,None]
 
         if VERIFY:
             # Verify that rv has no positive component along gV.
@@ -95,6 +97,294 @@ class Dynamics(nn.Module):
 
         for name, value in zip(param_names, hn_params):
             setattr(self, name, value)
+
+
+class PolarLimitCycleShapeFn(nn.Module):
+    """phi(x) = ||x|| - r(theta(x)), where r(theta) > 0 is a learned radius function.
+
+    The zero set {phi(x) = 0} is exactly {||x|| = r(theta(x))}, which is a
+    star-shaped closed curve around the origin by construction — no topological
+    constraint or eikonal regularizer needed.
+
+    Requires the origin to lie strictly inside the limit cycle, which is ensured
+    by centering the data on the trajectory centroid (center_mode='centroid').
+
+    phi < 0 inside the cycle, phi > 0 outside.
+    """
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.r_net = nn.Sequential(
+            nn.Linear(2, hidden),    # input: (cos theta, sin theta)
+            nn.Tanh(),
+            nn.Linear(hidden, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, 1),
+            nn.Softplus(),           # r(theta) > 0 always
+        )
+
+    def forward(self, x):
+        norm    = x.norm(dim=-1, keepdim=True).clamp(min=1e-6)  # ||x||
+        cos_sin = x / norm                                        # unit direction
+        r       = self.r_net(cos_sin)                            # (N, 1), > 0
+        return norm - r                                           # phi = ||x|| - r(theta)
+
+
+class LimitCycleV(nn.Module):
+    """V_lc(x) = ReHU_d(phi(x)^2) + eps * ||x||^2
+
+    phi is the polar shape function learned in Phase 0 (phi = 0 on limit cycle).
+
+    The eps * ||x||^2 quadratic floor gives a non-vanishing gradient at the cycle:
+        grad V_lc|_{phi=0} = 2 * eps * x_cycle  != 0
+    so the CLF projection remains active on the cycle with a small correction
+    proportional to eps, allowing fhat to drive tangential (periodic) motion.
+
+    eps controls both the floor gradient magnitude and V_lc on the cycle
+    (V_lc|_cycle = eps * r^2, small for small eps).
+    d controls ReHU smoothing of phi^2 near the zero set.
+    """
+    def __init__(self, phi, eps=0.01, d=1.0):
+        super().__init__()
+        self.phi  = phi
+        self.eps  = eps
+        self.rehu = ReHU(d)
+
+    def forward(self, x):
+        phi_sq = self.phi(x).pow(2)                     # (N, 1)
+        quad   = self.eps * (x ** 2).sum(1, keepdim=True)  # (N, 1)
+        return self.rehu(phi_sq) + quad
+
+    def invalidate_zero_cache(self):
+        pass   # no-op; no cache to manage
+
+
+class FactoredLimitCycleV(nn.Module):
+    """V(x) = MonotoneNet(phi(x)^2) + eps * ||x||^2
+
+    phi (frozen after Phase 0) pins the zero set exactly to the learned limit
+    cycle.  MonotoneNet is strictly monotone with s(0)=0, so V is unimodal in
+    |phi|: it increases monotonically as you move away from the cycle in either
+    direction, with no spurious peaks.  MonotoneNet parameters are fully
+    learnable, controlling how steeply V rises away from the cycle.
+
+    Gradient on the cycle (phi = 0):
+        ∇V = 2·eps·x  (radial, non-zero)  →  CLF projection stays active.
+    """
+    def __init__(self, phi, n_basis=32, eps=0.01):
+        super().__init__()
+        self.phi  = phi
+        self.mono = MonotoneNet(n_basis)
+        self.eps  = eps
+
+    def forward(self, x):
+        phi_sq = self.phi(x).pow(2)   # (N, 1); V=0 iff phi=0 iff on limit cycle
+        return self.mono(phi_sq)
+
+    def invalidate_zero_cache(self):
+        pass
+
+
+class PICNN(nn.Module):
+    """Partially Input Convex Neural Network f(x, y; theta).
+
+    Convex in y, unconstrained in x.  Architecture from Amos et al. 2017:
+
+        u_0     = x
+        u_{i+1} = g̃_i(Ũ_i u_i + b̃_i)                          [x-path, free]
+        z_0     = 0
+        z_{i+1} = g_i(
+            W_i^z (z_i ⊙ softplus(W_i^zu u_i + b_i^z))          [z pass-through, Wz ≥ 0]
+          + W_i^y (y  ⊙ softplus(W_i^yu u_i + b_i^y))           [y input, scaled by u]
+          + W_i^u u_i + b_i                                       [additive bias from x]
+        )
+        f = z_k
+
+    Non-negativity of W^z (enforced via softplus) ensures convexity in y.
+    W^zu, W^yu, W^u are unconstrained — x can modulate everything freely.
+    """
+    def __init__(self, x_dim, y_dim, u_hidden, z_hidden, n_layers):
+        super().__init__()
+        self.n_layers = n_layers
+        u_dims = [x_dim] + [u_hidden] * n_layers
+        z_dims = [z_hidden] * n_layers + [1]
+
+        # x-path: standard feedforward
+        self.u_layers = nn.ModuleList([
+            nn.Linear(u_dims[i], u_dims[i + 1]) for i in range(n_layers)
+        ])
+
+        # z pass-through weights W^z (raw; applied via softplus to enforce ≥ 0)
+        in_z = [y_dim] + [z_hidden] * (n_layers - 1)
+        self.Wz_raw = nn.ParameterList([
+            nn.Parameter(torch.randn(z_dims[i], in_z[i]) * 0.1)
+            for i in range(n_layers)
+        ])
+
+        # y → z weights W^y (raw; softplus-enforced ≥ 0 so PICNN is monotone in y from 0)
+        self.Wy_raw = nn.ParameterList([
+            nn.Parameter(torch.randn(z_dims[i], y_dim) * 0.1)
+            for i in range(n_layers)
+        ])
+
+        # u → z_i gate  W^zu  (scales the z pass-through)
+        self.Wzu = nn.ModuleList([
+            nn.Linear(u_dims[i], in_z[i], bias=True)
+            for i in range(n_layers)
+        ])
+
+        # u → y gate  W^yu  (scales the y input)
+        self.Wyu = nn.ModuleList([
+            nn.Linear(u_dims[i], y_dim, bias=True)
+            for i in range(n_layers)
+        ])
+
+        # u → z additive bias  W^u
+        self.Wu = nn.ModuleList([
+            nn.Linear(u_dims[i], z_dims[i], bias=True)
+            for i in range(n_layers)
+        ])
+
+        # final output projection z_hidden → 1 (≥ 0 weights to preserve monotonicity)
+        self.Wfinal_raw = nn.Parameter(torch.randn(1, z_hidden) * 0.1)
+        self.bfinal     = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x, y):
+        u = x
+        z = torch.zeros(x.shape[0], 1, device=x.device, dtype=x.dtype)  # z_0 = 0
+
+        for i in range(self.n_layers):
+            Wz = F.softplus(self.Wz_raw[i])                         # (z_dim, in_z), ≥ 0
+            z_gate  = F.softplus(self.Wzu[i](u))                    # (N, in_z)
+            y_gate  = F.softplus(self.Wyu[i](u))                    # (N, y_dim)
+
+            z = F.softplus(
+                F.linear(z * z_gate, Wz)                             # convex z pass-through
+                + F.linear(y * y_gate, F.softplus(self.Wy_raw[i]))   # y input, Wy ≥ 0 → monotone in y
+                + self.Wu[i](u)                                      # additive x bias
+            )
+            u = F.softplus(self.u_layers[i](u))                      # advance u-path
+
+        # project z_hidden → 1; Wfinal ≥ 0 preserves monotonicity in y
+        return F.linear(z, F.softplus(self.Wfinal_raw), self.bfinal)  # (N, 1)
+
+
+class PhiAngularV(nn.Module):
+    """V(x) = ReHU(PICNN(cosθ,sinθ ; phi²) − PICNN(cosθ,sinθ ; 0)) + eps·‖x‖²
+
+    Uses a PICNN that is convex in phi² (y-path) and unconstrained in
+    (cosθ, sinθ) (x-path).
+
+    Convexity in phi² guarantees the network is non-decreasing from phi²=0,
+    so PICNN(...; phi²) ≥ PICNN(...; 0) for all phi² ≥ 0.  The reference
+    subtraction then gives zero exactly on the cycle (phi=0) and positive
+    everywhere else — no level-set loss needed.
+
+    The unconstrained x-path lets the network freely shape how steeply V
+    rises at different angles around the cycle.
+    """
+    def __init__(self, phi, picnn, eps=0.01, d=1.0):
+        super().__init__()
+        self.phi   = phi
+        self.picnn = picnn
+        self.rehu  = ReHU(d)
+        self.eps   = eps
+
+    def forward(self, x):
+        norm    = x.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        cos_sin = x / norm                                         # (N, 2)
+        phi_sq  = self.phi(x).pow(2)                              # (N, 1), ≥ 0
+
+        V_z   = self.picnn(cos_sin, phi_sq)                       # (N, 1)
+        V_ref = self.picnn(cos_sin, torch.zeros_like(phi_sq))     # (N, 1), phi²=0
+        raw   = V_z - V_ref                                       # (N, 1), ≥ 0 by monotonicity
+        return self.rehu(raw)                                      # V=0 iff phi=0 iff on limit cycle
+
+    def invalidate_zero_cache(self):
+        pass
+
+
+class PhiWarpedICNNV(nn.Module):
+    """V(x) = ReHU(ICNN(phi(x)·n̂(x)) − ICNN(0)) + eps·phi(x)²
+
+    Warp  F(x) = phi(x) · n̂(x),  where n̂ = ∇phi / ‖∇phi‖  (unit outward normal).
+
+    Limit cycle: phi = 0  →  F = 0  →  ICNN(0) − ICNN(0) = 0  →  V = 0.
+    Off cycle:   phi ≠ 0  →  F ≠ 0  →  V ≥ eps·phi² > 0.
+
+    n̂ is computed via detached autograd so that ∇V only involves first-order
+    derivatives of phi.  The dropped term phi·∂n̂/∂x vanishes exactly at phi=0
+    (the limit cycle), so the CLF gradient is exact where it matters most.
+
+    The ICNN operates in the warped 2D space and is fully learnable — its level
+    sets in warp-space can be arbitrary convex shapes, which pull back through
+    the phi·n̂ map to give rich non-circular level sets in the original space.
+    """
+
+    def __init__(self, phi, icnn, eps=0.01, d=1.0):
+        super().__init__()
+        self.phi  = phi
+        self.icnn = icnn
+        self.rehu = ReHU(d)
+        self.eps  = eps
+        self._zero_cache = None
+
+    def invalidate_zero_cache(self):
+        self._zero_cache = None
+
+    def forward(self, x):
+        # unit outward normal n̂ = ∇phi / ‖∇phi‖ — detached, no second-order grads
+        with torch.enable_grad():
+            x_d = x.detach().requires_grad_(True)
+            grad_phi = torch.autograd.grad(self.phi(x_d).sum(), x_d)[0].detach()  # (N, d)
+        n_hat = grad_phi / grad_phi.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+
+        # warp: F(x) = phi(x) · n̂  — differentiable through phi_val only
+        phi_val = self.phi(x)        # (N, 1)
+        F_x = phi_val * n_hat        # (N, d)
+
+        if self._zero_cache is None:
+            with torch.no_grad():
+                z = torch.zeros(1, x.shape[-1], device=x.device, dtype=x.dtype)
+                self._zero_cache = self.icnn(z).detach()
+
+        raw  = self.rehu(self.icnn(F_x) - self._zero_cache)  # (N, 1), ≥ 0
+        quad = self.eps * phi_val.pow(2)                      # eps·phi², vanishes on cycle
+        return raw + quad
+
+
+class ICNNLimitCycleV(nn.Module):
+    """V_lc(x) = sqrt((V_icnn(x) - v_gamma)^2 + eps^2) - eps   [pseudo-Huber]
+
+    The limit cycle is the level set {V_icnn(x) = v_gamma}.
+      Inside cycle:  V_icnn < v_gamma  =>  V_lc > 0  (inverted bowl)
+      Outside cycle: V_icnn > v_gamma  =>  V_lc > 0  (normal bowl)
+      On cycle:      V_icnn = v_gamma  =>  V_lc = 0
+
+    Pseudo-Huber smooths the V-shaped kink of plain abs() at the zero crossing:
+      grad V_lc = (V_icnn - v_gamma) / sqrt(...) * grad V_icnn
+    varies continuously across the cycle instead of flipping sign abruptly,
+    producing a smoother learned boundary.
+
+    v_gamma is a learnable scalar. Align the level set with demo trajectories via
+    level_set_loss(x_demo), which penalizes (V_icnn(x_demo) - v_gamma)^2.
+    """
+    def __init__(self, icnn, v_gamma_init=1.0, eps_smooth=0.05):
+        super().__init__()
+        self.icnn = icnn
+        self.v_gamma    = nn.Parameter(torch.tensor(float(v_gamma_init)))
+        self.eps_smooth = eps_smooth
+
+    def forward(self, x):
+        d = self.icnn(x) - self.v_gamma
+        return (d.pow(2) + self.eps_smooth ** 2).sqrt() - self.eps_smooth  # (N, 1)
+
+    def level_set_loss(self, x_demo):
+        """Soft constraint: V_icnn(x_demo) ~= v_gamma (demo points on level set)."""
+        return (self.icnn(x_demo) - self.v_gamma).pow(2).mean()
+
+    def invalidate_zero_cache(self):
+        if hasattr(self.icnn, 'invalidate_zero_cache'):
+            self.icnn.invalidate_zero_cache()
 
 
 class ICNN(nn.Module):
@@ -141,6 +431,135 @@ class ReHU(nn.Module):
 
     def forward(self, x):
         return torch.max(torch.clamp(torch.sign(x)*self.a/2*x**2,min=0,max=-self.b),x+self.b)
+
+class MonotoneNet(nn.Module):
+    """Scalar monotone function s: R → R with s(0) = 0 and s'(r) > 0 everywhere.
+
+    Parameterized as s(r) = Σ_i w_i · [softplus(a_i·r + b_i) − softplus(b_i)]
+    where w_i = exp(log_w_i) > 0 and a_i = exp(log_a_i) > 0.
+
+    s'(r) = Σ_i w_i · a_i · sigmoid(a_i·r + b_i) > 0  (sum of positive terms).
+    s(0)  = Σ_i w_i · [softplus(b_i) − softplus(b_i)] = 0.
+    """
+    def __init__(self, n_basis=32):
+        super().__init__()
+        # Initialise near-identity: s'(0) = Σ w_i·a_i·sigmoid(b_i) = 1
+        # With a_i=1, b_i=0 → sigmoid=0.5, need Σ w_i = 2 → w_i = 2/n_basis
+        init_log_w = math.log(2.0 / n_basis)
+        self.log_w = nn.Parameter(torch.full((n_basis,), init_log_w))
+        self.log_a = nn.Parameter(torch.zeros(n_basis))
+        self.b     = nn.Parameter(torch.zeros(n_basis))
+
+    def forward(self, r):
+        w    = self.log_w.exp()                               # (n_basis,)
+        a    = self.log_a.exp()                               # (n_basis,)
+        ar_b = r * a + self.b                                 # (N, n_basis) via broadcast
+        return (w * (F.softplus(ar_b) - F.softplus(self.b))).sum(-1, keepdim=True)  # (N, 1)
+
+
+class RadialWarp(nn.Module):
+    """Learned radial deformation: F(x) = s(‖x‖) · x / ‖x‖.
+
+    s (MonotoneNet) is strictly monotone with s(0) = 0, so F is a bijection:
+      - Angles are preserved exactly.
+      - Only the radial scale changes, determined by s.
+      - Inverse: F⁻¹(y) = s⁻¹(‖y‖) · y / ‖y‖  (s⁻¹ via bisection if needed).
+
+    At x = 0: s(r)/r → s'(0) > 0 by L'Hôpital, so F is smooth at the origin.
+    """
+    def __init__(self, n_basis=32):
+        super().__init__()
+        self.s_net = MonotoneNet(n_basis)
+
+    def forward(self, x):
+        r   = x.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # ‖x‖, (N, 1)
+        s_r = self.s_net(r)                                   # s(‖x‖), (N, 1)
+        return x * (s_r / r)                                  # (N, d)
+
+
+class AffineCouple(nn.Module):
+    """Single affine coupling layer for Real NVP.
+
+    Splits x into (x1, x2).  When mask='first', x1 is passed through unchanged
+    and x2 is transformed:  y2 = x2 * exp(tanh(s(x1))) + t(x1).
+    Alternating mask='first'/'second' across layers mixes all dimensions.
+    tanh on log-scale keeps the Jacobian bounded during early training.
+    """
+    def __init__(self, dim, hidden=64, mask='first'):
+        super().__init__()
+        d1 = dim // 2
+        d2 = dim - d1
+        self.d1   = d1
+        self.mask = mask
+        cond_dim  = d1 if mask == 'first' else d2
+        xform_dim = d2 if mask == 'first' else d1
+        self.net = nn.Sequential(
+            nn.Linear(cond_dim,  hidden), nn.Tanh(),
+            nn.Linear(hidden,    hidden), nn.Tanh(),
+            nn.Linear(hidden, xform_dim * 2),
+        )
+
+    def forward(self, x):
+        x1, x2 = x[:, :self.d1], x[:, self.d1:]
+        cond, xform = (x1, x2) if self.mask == 'first' else (x2, x1)
+        log_s, t = self.net(cond).chunk(2, dim=-1)
+        log_s = torch.tanh(log_s)
+        y = xform * log_s.exp() + t
+        out1, out2 = (cond, y) if self.mask == 'first' else (y, cond)
+        return torch.cat([out1, out2], dim=-1)
+
+
+class RealNVP(nn.Module):
+    """Stack of affine coupling layers: a continuously differentiable invertible warp F(x).
+
+    Alternates which half of x is conditioned on so that all dimensions interact.
+    The composition is invertible by construction (each layer is invertible).
+    """
+    def __init__(self, dim=2, n_layers=4, hidden=64):
+        super().__init__()
+        masks = (['first', 'second'] * ((n_layers + 1) // 2))[:n_layers]
+        self.layers = nn.ModuleList(
+            [AffineCouple(dim, hidden=hidden, mask=m) for m in masks]
+        )
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+class WarpedMakePSD(nn.Module):
+    """Warped Lyapunov function: V(x) = ReHU_d(g(F(x)) - g(F(0))) + eps * ||x||²
+
+    F (RealNVP) warps the input space before the ICNN g, allowing g to be convex
+    in the warped space while the composite g∘F captures non-convex level sets in
+    the original space.  Invertibility of F guarantees the sublevel sets of g∘F
+    remain contiguous (no spurious local minima).
+
+    The eps * ||x||² floor keeps V(0) = 0 and ∇V(0) well-defined regardless of
+    where F maps the origin.
+    """
+    def __init__(self, f, flow, n, eps=0.01, d=1.0):
+        super().__init__()
+        self.f    = f     # ICNN  g
+        self.flow = flow  # RealNVP  F
+        self.eps  = eps
+        self.rehu = ReHU(d)
+        self._zero_cache = None
+
+    def invalidate_zero_cache(self):
+        self._zero_cache = None
+
+    def forward(self, x):
+        if self._zero_cache is None:
+            with torch.no_grad():
+                z = torch.zeros(1, x.shape[-1], dtype=x.dtype, device=x.device)
+                self._zero_cache = self.f(self.flow(z)).detach()
+        Fx = self.flow(x)
+        smoothed = self.rehu(self.f(Fx) - self._zero_cache)
+        quad     = self.eps * (x ** 2).sum(1, keepdim=True)
+        return smoothed + quad
+
 
 class MakePSD(nn.Module):
     def __init__(self, f, n, eps=0.01, d=1.0):

@@ -4,7 +4,18 @@ import argparse
 from datetime import datetime
 
 import numpy as np
+import matplotlib
+matplotlib.rcParams.update({
+    'font.size':        20,
+    'axes.titlesize':   20,
+    'axes.labelsize':   20,
+    'xtick.labelsize':  20,
+    'ytick.labelsize':  20,
+    'legend.fontsize':  14,
+    'figure.titlesize': 20,
+})
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
@@ -21,7 +32,7 @@ sys.path.insert(0, os.path.join(repo, "utils"))
 sys.path.insert(0, os.path.join(repo, "src"))   # must be first: shadows utils/node.py
 
 from node import MLP, rollout, rollout_to_convergence
-from lsddm import Dynamics, ICNN, MakePSD, WarpedMakePSD, RadialWarp, ICNNLimitCycleV
+from lsddm import Dynamics, ICNN, MakePSD, WarpedMakePSD, RadialWarp, ICNNLimitCycleV, FactoredLimitCycleV, PICNN, PhiAngularV, PhiWarpedICNNV, PolarLimitCycleShapeFn
 
 
 # ---------------------------------------------------------------------------
@@ -230,14 +241,14 @@ def train_shape_fn(phi, data, epochs=1000, lr=1e-3):
     x_curve = pos.reshape(-1, pos.shape[-1]).to(device)
 
     opt  = torch.optim.Adam(phi.parameters(), lr=lr)
-    pbar = tqdm(range(epochs), desc="Phase 0 — phi", dynamic_ncols=True)
+    pbar = tqdm(range(epochs), desc="Phase 0 - phi", dynamic_ncols=True)
     for ep in pbar:
         loss = phi(x_curve).pow(2).mean()
         opt.zero_grad(); loss.backward(); opt.step()
         if ep % 100 == 0 or ep == epochs - 1:
             pbar.set_postfix(loss=f"{loss.item():.6f}")
 
-    tqdm.write(f"  phi done — |phi(demo)|.mean = {phi(x_curve).abs().mean().item():.6f}")
+    tqdm.write(f"  phi done - |phi(demo)|.mean = {phi(x_curve).abs().mean().item():.6f}")
 
 
 def save_shape_fn_plot(phi, data, save_path, lim=1.3, grid_n=300):
@@ -278,7 +289,7 @@ def save_shape_fn_plot(phi, data, save_path, lim=1.3, grid_n=300):
     ax.scatter(0, 0, c='yellow', s=60, zorder=5, label='centroid')
     fig.colorbar(cf, ax=ax, label='phi(x)', shrink=0.85)
     ax.set_aspect('equal'); ax.set_title('phi(x)  [white = phi=0]')
-    ax.legend(fontsize=7, loc='lower right')
+    ax.legend(loc='lower right')
     ax.set_xlabel('$x_1$'); ax.set_ylabel('$x_2$')
 
     ax = fig.add_subplot(gs[1])
@@ -293,7 +304,7 @@ def save_shape_fn_plot(phi, data, save_path, lim=1.3, grid_n=300):
     ax = fig.add_subplot(gs[2], projection='polar')
     ax.plot(theta_np, r_vals, c='crimson', linewidth=2.0)
     ax.fill(theta_np, r_vals, alpha=0.15, color='crimson')
-    ax.set_title('r(theta) — learned radius', pad=18)
+    ax.set_title('r(theta) - learned radius', pad=18)
 
     ax = fig.add_subplot(gs[3])
     for i in range(pos_gt.shape[0]):
@@ -302,10 +313,10 @@ def save_shape_fn_plot(phi, data, save_path, lim=1.3, grid_n=300):
     ax.plot(cycle_x, cycle_y, c='crimson', linewidth=2.0, label='phi=0')
     ax.scatter(0, 0, c='black', s=60, zorder=5, label='centroid')
     ax.set_aspect('equal'); ax.set_title('Demo vs learned cycle')
-    ax.legend(fontsize=7, loc='lower right')
+    ax.legend(loc='lower right')
     ax.set_xlabel('$x_1$'); ax.set_ylabel('$x_2$')
 
-    fig.suptitle('Phase 0 — phi(x) = ||x|| - r(theta)', fontsize=13)
+    fig.suptitle('Phase 0 - phi(x) = ||x|| - r(theta)')
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"Shape fn plot saved to {save_path}")
@@ -313,9 +324,13 @@ def save_shape_fn_plot(phi, data, save_path, lim=1.3, grid_n=300):
 
 
 def build_model(hidden_dim=256, alpha=0.1, stability_mode='off', eps=1.0, d=1.0, dim=2,
-                limit_cycle=False, eps_smooth=0.05, flow_layers=0, flow_hidden=64, clf_d=0.1):
+                limit_cycle=False, eps_smooth=0.05, flow_layers=0, flow_hidden=64, clf_d=0.1,
+                phi=None):
     fhat = MLP(in_dim=dim, out_dim=dim, hidden_dim=256, num_layers=5)
-    if limit_cycle:
+    if limit_cycle and phi is not None:
+        icnn = ICNN([dim, hidden_dim, hidden_dim, hidden_dim, hidden_dim, 1])
+        V    = PhiWarpedICNNV(phi, icnn, eps=eps, d=d)
+    elif limit_cycle:
         icnn = ICNN([dim, hidden_dim, hidden_dim, hidden_dim, hidden_dim, 1])
         V    = ICNNLimitCycleV(icnn, v_gamma_init=1.0, eps_smooth=eps_smooth)
     elif flow_layers > 0:
@@ -360,8 +375,10 @@ def _compute_grid(dynamics, N=41, lim=1.2):
 
 def _draw_streamplot(ax, x_np, y_np, U, V_f):
     """Violet streamplot."""
-    ax.streamplot(x_np, y_np, U, V_f,
-                  color='mediumorchid', linewidth=0.6, arrowsize=0.7, density=1.2)
+    sp = ax.streamplot(x_np, y_np, U, V_f,
+                       color='plum', linewidth=1.2, arrowsize=1.8, density=1.2)
+    sp.lines.set_alpha(0.85)
+    sp.arrows.set_alpha(0.85)
     ax.axhline(0, color='k', linewidth=0.4, alpha=0.4)
     ax.axvline(0, color='k', linewidth=0.4, alpha=0.4)
     ax.set_xlim(x_np[0], x_np[-1]); ax.set_ylim(y_np[0], y_np[-1])
@@ -382,8 +399,6 @@ def _draw_lyapunov_cf(ax, x_np, y_np, V_lyap, gamma=0.4, is_lc=False, phi_grid=N
         # phi=0 is the exact learned limit cycle
         ax.contour(x_np, y_np, phi_grid, levels=[0.0], colors='lime',
                    linewidths=2.0, zorder=6)
-        from matplotlib.lines import Line2D
-        ax.add_artist(Line2D([0], [0], color='lime', linewidth=2, label='Limit cycle (phi=0)'))
     else:
         ax.plot(0.0, 0.0, 'ro', markersize=8, markeredgecolor='white', markeredgewidth=1.0,
                 zorder=6, label='V=0')
@@ -403,7 +418,7 @@ def _draw_lyapunov(fig, ax, x_np, y_np, V_lyap):
     """Standalone Lyapunov panel."""
     cf = _draw_lyapunov_cf(ax, x_np, y_np, V_lyap)
     _attach_colorbar(fig, ax, cf)
-    ax.legend(loc='upper right', fontsize=8)
+    ax.legend(loc='upper right')
     ax.set_aspect('equal'); ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$")
 
 
@@ -447,9 +462,9 @@ def _draw_lyapunov_surface_3d(ax, x_np, y_np, V_lyap, U=None, V_f=None, is_lc=Fa
         dx = float(U[iy, ix]) / raw * scale
         dy = float(V_f[iy, ix]) / raw * scale
         ax.quiver(px, py, pv, dx, dy, 0,
-                  color='white', linewidth=2.0, arrow_length_ratio=0.4, zorder=8)
+                  color='white', linewidth=3.0, arrow_length_ratio=0.5, zorder=8)
         ax.text(px + dx * 1.5, py + dy * 1.5, pv + (vmax - vmin) * 0.06,
-                r'$f(x)$', color='white', fontsize=10, zorder=9)
+                r'$f(x)$', color='white', fontsize=16, zorder=9)
 
     if is_lc and phi_grid is not None:
         # phi=0 is the exact learned limit cycle — draw it on the floor
@@ -548,34 +563,19 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.02,
 
     # Limit cycle trajectories never converge to origin, so cap chunks lower and
     # batch all x0s (original + perturbed) into one ODE call for GPU efficiency.
-    max_chunks = max(5 if is_lc else 1, int(np.ceil(5 * pos_gt.shape[1] / len(t_eval))))
-    offsets = [np.array([perturb, 0.0]), np.array([-perturb, 0.0])]
-    x0_perturb_list = [
-        (x0_batch + torch.tensor(off, dtype=torch.float32,
-                                  device=x0_batch.device)).clamp(-1.2, 1.2)
-        for off in offsets
-    ]
-    # Single batched ODE call: [original; perturbed_0; perturbed_1; ...]
-    x0_all = torch.cat([x0_batch] + x0_perturb_list, dim=0)  # (N*(1+n_off), d)
-    all_traj_np = rollout_to_convergence(dynamics, x0_all, t_eval,
-                                         max_chunks=max_chunks).cpu().numpy()
-    N = x0_batch.shape[0]
-    x_pred_np    = all_traj_np[:N]           # original
-    x_perturb_np = all_traj_np[N:]           # perturbed, shape (N*n_off, T_total, d)
+    max_chunks = max(1, int(np.ceil(3 * pos_gt.shape[1] / len(t_eval))))
+    x_pred_np = rollout_to_convergence(dynamics, x0_batch, t_eval,
+                                       max_chunks=max_chunks).cpu().numpy()
 
     for i in range(x_pred_np.shape[0]):
         ax.plot(x_pred_np[i, :, 0], x_pred_np[i, :, 1], c='crimson',
                 linewidth=1.5, zorder=4, label='Model' if i == 0 else None)
     _mark_endpoints(x_pred_np, 'crimson', markersize=7)
 
-    # Perturbed rollouts (dashed, lighter)
-    _perturb_labeled = False
-    for j in range(x_perturb_np.shape[0]):
-        label = 'Perturbed' if not _perturb_labeled else None
-        _perturb_labeled = True
-        ax.plot(x_perturb_np[j, :, 0], x_perturb_np[j, :, 1], c='crimson',
-                linewidth=0.8, linestyle='--', alpha=0.45, zorder=4, label=label)
-    _mark_endpoints(x_perturb_np, 'crimson', markersize=4, alpha=0.6)
+    # Perturbed rollouts disabled
+    # offsets = [np.array([perturb, 0.0]), np.array([-perturb, 0.0])]
+    # x0_perturb_list = [...]
+    # ...
 
     # Probe rollouts from a uniform grid to reveal spurious attractors
     if show_probe:
@@ -618,7 +618,7 @@ def _plot_traj_panel(ax, data, dynamics, t_eval, title="", perturb=0.02,
 
     ax.set_aspect('equal'); ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$")
     ax.set_title(title)
-    ax.legend(loc='lower left', fontsize=8)
+    ax.legend(loc='lower right')
 
 
 def _plot_traj_panel_3d(ax, data, dynamics, t_eval, title="", perturb=0.02):
@@ -642,7 +642,7 @@ def _plot_traj_panel_3d(ax, data, dynamics, t_eval, title="", perturb=0.02):
     ax.scatter(0.0, 0.0, 0.0, c='black', marker='x', s=100, linewidths=2,
                zorder=5, label='Target')
 
-    max_chunks = max(1, int(np.ceil(5 * pos_gt.shape[1] / len(t_eval))))
+    max_chunks = max(1, int(np.ceil(3 * pos_gt.shape[1] / len(t_eval))))
     x_pred_np = rollout_to_convergence(dynamics, x0_batch, t_eval,
                                        max_chunks=max_chunks).cpu().numpy()
     for i in range(x_pred_np.shape[0]):
@@ -668,7 +668,7 @@ def _plot_traj_panel_3d(ax, data, dynamics, t_eval, title="", perturb=0.02):
     ax.invert_yaxis()
     ax.set_xlabel("$x_1$"); ax.set_ylabel("$x_2$"); ax.set_zlabel("$x_3$")
     ax.set_title(title)
-    ax.legend(loc='upper left', fontsize=7)
+    ax.legend(loc='upper left')
     ax.invert_yaxis()
     ax.view_init(elev=25, azim=160, roll=0)  # looking from negative x1 toward +x1
 
@@ -759,12 +759,13 @@ def _make_figure(dynamics, data, t_eval, title_suffix, fig_kw):
         x_np, y_np, U, V_f, _, _ = _compute_grid(dynamics)
         fig, ax = plt.subplots(figsize=(7, 7), **fig_kw)
         _plot_traj_panel(ax, data, dynamics, t_eval,
-                         title=f"Vector field {title_suffix}",
+                         title=f"Vector field - {title_suffix}",
                          grid_data=(x_np, y_np, U, V_f))
         fig.tight_layout()
         return fig
 
     is_lc = (dynamics.stability_mode == 'limit_cycle')
+    tqdm.write("  [vis] computing grid (V, ∇V, dV/dt) ...")
     x_np, y_np, U, V_f, V_lyap, dotV = _compute_grid(dynamics)
     grid_data = (x_np, y_np, U, V_f)
     lyap_data  = (x_np, y_np, V_lyap)
@@ -772,6 +773,7 @@ def _make_figure(dynamics, data, t_eval, title_suffix, fig_kw):
     # Compute cycle boundary grid for limit cycle contour overlays
     phi_grid = None
     if is_lc:
+        tqdm.write("  [vis] computing phi grid for cycle contour ...")
         device = next(dynamics.parameters()).device
         N_g, lim_g = 41, 1.2
         xs_g = torch.linspace(-lim_g, lim_g, N_g, device=device)
@@ -785,38 +787,62 @@ def _make_figure(dynamics, data, t_eval, title_suffix, fig_kw):
                 phi_grid = (dynamics.V.icnn(grid_g) - v_gamma).reshape(N_g, N_g).cpu().numpy()
 
     v_label = '$V_{lc}(x)$' if is_lc else '$V(x)$'
-    fig = plt.figure(figsize=(28, 7), **fig_kw)
+    fig = plt.figure(figsize=(35, 7), **fig_kw)
 
     # Panel 1: vector field + rollouts (2D)
-    ax1 = fig.add_subplot(1, 4, 1)
+    tqdm.write("  [vis] panel 1/5: vector field + rollouts ...")
+    ax1 = fig.add_subplot(1, 5, 1)
     _plot_traj_panel(ax1, data, dynamics, t_eval,
-                     title=f"Vector field {title_suffix}",
+                     title=f"{title_suffix} — Vector field",
                      grid_data=grid_data)
 
     # Panel 2: Lyapunov 3D surface
-    ax2 = fig.add_subplot(1, 4, 2, projection='3d')
+    tqdm.write("  [vis] panel 2/5: Lyapunov 3D surface ...")
+    ax2 = fig.add_subplot(1, 5, 2, projection='3d')
     surf = _draw_lyapunov_surface_3d(ax2, x_np, y_np, V_lyap, U=U, V_f=V_f,
                                      is_lc=is_lc, phi_grid=phi_grid)
-    ax2.set_title(f"{v_label} {title_suffix}", pad=12)
+    ax2.set_title(f"{title_suffix} — {v_label}", pad=12)
     fig.colorbar(surf, ax=ax2, shrink=0.55, pad=0.1, label=v_label)
 
     # Panel 3: dV/dt heatmap (2D)
-    ax3 = fig.add_subplot(1, 4, 3)
+    tqdm.write("  [vis] panel 3/5: dV/dt heatmap ...")
+    ax3 = fig.add_subplot(1, 5, 3)
     _draw_dotv(fig, ax3, x_np, y_np, dotV)
-    ax3.set_title(r"$\dot V = \nabla V \cdot f$ " + title_suffix)
+    ax3.set_title(f"{title_suffix} — " + r"$\dot V = \nabla V \cdot f$")
 
     # Panel 4: combined overlay (2D): Lyapunov contourf + streamplot + rollouts
-    ax4 = fig.add_subplot(1, 4, 4)
+    tqdm.write("  [vis] panel 4/5: combined overlay + rollouts ...")
+    ax4 = fig.add_subplot(1, 5, 4)
     _plot_traj_panel(ax4, data, dynamics, t_eval,
-                     title=f"Combined {title_suffix}",
+                     title=f"{title_suffix} — Combined",
                      grid_data=grid_data,
                      lyap_data=lyap_data, fig=fig, phi_grid=phi_grid)
 
+    # Panel 5: raw fhat (no CLF projection) + Lyapunov contourf
+    tqdm.write("  [vis] panel 5/5: raw fhat + Lyapunov ...")
+    ax5 = fig.add_subplot(1, 5, 5)
+    device = next(dynamics.parameters()).device
+    N_g, lim_g = 41, 1.2
+    x_lin = torch.linspace(-lim_g, lim_g, N_g)
+    y_lin = torch.linspace(-lim_g, lim_g, N_g)
+    XX, YY = torch.meshgrid(x_lin, y_lin, indexing='xy')
+    grid_raw = torch.stack([XX.ravel(), YY.ravel()], dim=1).to(device)
+    with torch.no_grad():
+        vel_raw = dynamics.fhat(grid_raw)
+    U_raw = vel_raw[:, 0].reshape(N_g, N_g).cpu().numpy()
+    V_raw = vel_raw[:, 1].reshape(N_g, N_g).cpu().numpy()
+    cf5 = _draw_lyapunov_cf(ax5, x_np, y_np, V_lyap, is_lc=is_lc, phi_grid=phi_grid)
+    _attach_colorbar(fig, ax5, cf5, label=v_label)
+    _draw_streamplot(ax5, x_lin.numpy(), y_lin.numpy(), U_raw, V_raw)
+    ax5.set_title(f"{title_suffix} — Raw $\\hat{{f}}$ + {v_label}")
+    ax5.set_aspect('equal'); ax5.set_xlabel("$x_1$"); ax5.set_ylabel("$x_2$")
+
+    tqdm.write("  [vis] saving figure ...")
     fig.tight_layout()
     return fig
 
 
-def save_intermediate_plot(dynamics, data, t_eval, epoch, logdir, dtwd=None, conv_mse=None, use_wandb=False):
+def save_intermediate_plot(dynamics, data, t_eval, epoch, logdir, dtwd=None, conv_mse=None, use_wandb=False, shape_name=''):
     """Save plot every eval_every epochs (2D: streamplot; 3D: trajectory axes)."""
     import matplotlib.pyplot as plt
     dynamics.eval()
@@ -824,9 +850,7 @@ def save_intermediate_plot(dynamics, data, t_eval, epoch, logdir, dtwd=None, con
     dim = data.get('dim', data['pos'].shape[-1])
     dtwd_tag    = f"_dtwd_{dtwd:.4f}"       if dtwd     is not None else ""
     convmse_tag = f"_convmse_{conv_mse:.4f}" if conv_mse is not None else ""
-    title_suffix = (f"— Epoch {epoch}  [{dynamics.stability_mode}]"
-                    + (f"  DTWD={dtwd:.4f}" if dtwd is not None else "")
-                    + (f"  ConvMSE={conv_mse:.4f}" if conv_mse is not None else ""))
+    title_suffix = shape_name
     if dim == 3:
         fig = _make_figure_3d(dynamics, data, t_eval, title_suffix=title_suffix, fig_kw={})
     else:
@@ -901,8 +925,10 @@ def evaluate(dynamics, data, solver='rk4') -> dict:
     rmse_vel = err.pow(2).mean().sqrt().item()
 
     x0_batch = data['x0']
+    tqdm.write(f"  [eval]   rollout {N} trajectories ({T} steps) ...")
     with torch.enable_grad():
         x_pred = rollout(dynamics, x0_batch, t, method=solver).detach()
+    tqdm.write(f"  [eval]   computing DTW ...")
     dtwd_vals = [_dtw_distance(x_pred[i].cpu().numpy(), pos_gt[i].cpu().numpy())
                  for i in range(N)]
     dtwd = float(np.mean(dtwd_vals))
@@ -921,7 +947,7 @@ def evaluate(dynamics, data, solver='rk4') -> dict:
 def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
           warmup_epochs=200, pos_weight=1.0, vel_weight=1.0, use_wandb=False,
           icnn_lr_scale=0.1, eval_every=100, lyapunov_only_epochs=200,
-          limit_cycle=False, levelset_weight=1.0):
+          limit_cycle=False, levelset_weight=1.0, shape_name='', data_eval=None):
     """Three-phase training.
 
     Standard (limit_cycle=False):
@@ -950,10 +976,12 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
         optimizer, T_max=warmup_epochs, eta_min=lr * 0.1
     )
 
+    data_eval = data_eval if data_eval is not None else data
+
     loss_history = []
     best_dtwd    = float('inf')
     best_path    = None
-    solver       = 'dopri5'
+    solver       = 'rk4'
     pbar = tqdm(range(1, num_epochs + 1), desc="Training", dynamic_ncols=True)
 
     for epoch in pbar:
@@ -1033,7 +1061,8 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
         # Evaluate every eval_every epochs and at the final epoch
         post_warmup = epoch > warmup_epochs
         if epoch % eval_every == 0 or epoch == num_epochs:
-            metrics  = evaluate(dynamics, data, solver=solver)
+            tqdm.write(f"  [eval] computing metrics (rollout + DTW) ...")
+            metrics  = evaluate(dynamics, data_eval, solver=solver)
             dtwd_str = f"{metrics['dtwd']:.4f}" if not (metrics['dtwd'] != metrics['dtwd']) else "N/A"
             tqdm.write(
                 f"[Epoch {epoch:>5}]  RMSE_vel={metrics['rmse_vel']:.6f}"
@@ -1080,9 +1109,9 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
                     torch.save(ckpt, best_path)
                     tqdm.write(f"  → {os.path.basename(best_path)} saved (best)")
 
-            save_intermediate_plot(dynamics, data, t, epoch, logdir,
+            save_intermediate_plot(dynamics, data_eval, t, epoch, logdir,
                                    dtwd=metrics['dtwd'], conv_mse=metrics['conv_mse'],
-                                   use_wandb=use_wandb)
+                                   use_wandb=use_wandb, shape_name=shape_name)
 
     return loss_history
 
@@ -1094,7 +1123,7 @@ def train(dynamics, data, logdir, num_epochs=500, lr=1e-3, weight_decay=1e-4,
 def main():
     parser = argparse.ArgumentParser(description="Train Stable NODE on 2D_messy-snake")
     parser.add_argument("--hidden_dim",    type=int,   default=64)
-    parser.add_argument("--alpha",         type=float, default=0.1) # Higher alpha → stronger stability regularization (V(x) dominates over fhat(x))
+    parser.add_argument("--alpha",         type=float, default=0.01) # Higher alpha → stronger stability regularization (V(x) dominates over fhat(x))
     parser.add_argument("--epochs",        type=int,   default=10000)
     parser.add_argument("--lr",            type=float, default=3e-3)
     parser.add_argument("--weight_decay",  type=float, default=0.0)
@@ -1108,7 +1137,7 @@ def main():
                         help="Weight for velocity loss term (0=disable)")
     parser.add_argument("--logdir",        type=str,   default=None,
                         help="Override experiment dir (default: logs/snode/<shape>/<datetime>)")
-    parser.add_argument("--warmup_epochs",  type=int,   default=500,
+    parser.add_argument("--warmup_epochs",  type=int,   default=1000,
                         help="Epochs with stability off (plain NODE warm-up), then ICNN projection")
     parser.add_argument("--icnn_lr_scale",        type=float, default=0.1,
                         help="LR multiplier for phase 2 (icnn), applied to both fhat and V")
@@ -1129,7 +1158,9 @@ def main():
     parser.add_argument("--d",              type=float, default=1e-5,
                         help="ReHU knee point in MakePSD (smaller → ICNN activates closer to origin)")
     parser.add_argument("--limit_cycle",      action="store_true",
-                        help="Enable limit-cycle mode: V_lc = |ICNN(x) - v_gamma| (pseudo-Huber)")
+                        help="Enable limit-cycle mode: trains phi in Phase 0, then V=phi^2*h(x)")
+    parser.add_argument("--phase0_epochs",    type=int,   default=1000,
+                        help="Epochs for Phase 0 polar shape fn (only used with --limit_cycle)")
     parser.add_argument("--center_mode",      type=str,   default='endpoint',
                         choices=['endpoint', 'centroid'],
                         help="IROS centering: 'endpoint' (default) or 'centroid' (required for limit_cycle)")
@@ -1137,7 +1168,7 @@ def main():
                         help="Pseudo-Huber smoothing epsilon for ICNNLimitCycleV")
     parser.add_argument("--levelset_weight",  type=float, default=1.0,
                         help="Weight for level-set alignment loss (ICNN(x_demo) ~= v_gamma)")
-    parser.add_argument("--flow_layers",     type=int,   default=8,
+    parser.add_argument("--flow_layers",     type=int,   default=4,
                         help="Warp enabled if >0; use 0 for plain ICNN (no radial warp)")
     parser.add_argument("--flow_hidden",     type=int,   default=64,
                         help="n_basis for RadialWarp MonotoneNet (more basis = more expressive s(r))")
@@ -1219,13 +1250,42 @@ def main():
 
     dim = int(data.get('dim', data['pos'].shape[-1]))
     print(f"  state dimension: {dim}D")
+
+    # Train/eval split: first 5 demos for training, remaining for eval
+    N_total = data['pos'].shape[0]
+    n_train = min(5, N_total)
+    def _split(d, start, end):
+        return {k: v[start:end] if isinstance(v, torch.Tensor) and v.shape[0] == N_total else v
+                for k, v in d.items()}
+    if args.limit_cycle:
+        data_train = data
+        data_eval  = data
+        print(f"  train demos: {N_total}  |  eval demos: {N_total}  (limit_cycle: no split)")
+    else:
+        data_train = _split(data, 0, n_train)
+        data_eval  = _split(data, n_train, N_total)
+        if data_eval['pos'].shape[0] == 0:
+            data_eval = data_train
+        print(f"  train demos: {n_train}  |  eval demos: {N_total - n_train}")
+
+    phi = None
+    if args.limit_cycle:
+        print(f"\nPhase 0 — learning polar shape fn for {args.phase0_epochs} epochs ...")
+        phi = PolarLimitCycleShapeFn(hidden=64).to(device)
+        train_shape_fn(phi, data, epochs=args.phase0_epochs)
+        save_shape_fn_plot(phi, data,
+                           save_path=os.path.join(args.logdir, "phase0_phi.png"))
+        for p in phi.parameters():
+            p.requires_grad_(False)
+
     dynamics = build_model(hidden_dim=args.hidden_dim, alpha=args.alpha,
                            stability_mode='off', eps=args.eps, d=args.d, dim=dim,
                            limit_cycle=args.limit_cycle,
                            eps_smooth=args.eps_smooth,
                            flow_layers=args.flow_layers,
                            flow_hidden=args.flow_hidden,
-                           clf_d=args.clf_d).to(device)
+                           clf_d=args.clf_d,
+                           phi=phi).to(device)
     n_params = sum(p.numel() for p in dynamics.parameters() if p.requires_grad)
     print(f"Model: {n_params} trainable parameters")
 
@@ -1239,12 +1299,13 @@ def main():
           f"{args.warmup_epochs+1}–{p2a_end}: {mode_tag} V/phi only (fhat frozen)  |  "
           f"{p2a_end+1}–{args.epochs}: joint fine-tune")
     loss_history = train(
-        dynamics, data, args.logdir,
+        dynamics, data_train, args.logdir,
         num_epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
         warmup_epochs=args.warmup_epochs, pos_weight=args.pos_weight, vel_weight=args.vel_weight,
         use_wandb=use_wandb, icnn_lr_scale=args.icnn_lr_scale,
         eval_every=args.eval_every, lyapunov_only_epochs=args.lyapunov_only_epochs,
         limit_cycle=args.limit_cycle, levelset_weight=args.levelset_weight,
+        shape_name=_ds_tag, data_eval=data_eval,
     )
 
     torch.save({
