@@ -23,17 +23,8 @@ import matplotlib.pyplot as plt
 import pickle
 import os
 
-
-# ---------------------------------------------------------------------------
-# 1. Data loading
-# ---------------------------------------------------------------------------
+# Data Loading
 def load_demos(path):
-    """Load 2D_messy-snake.mat -> list of (pos, vel) trajectories.
-
-    The .mat file stores Data as a 4 x N concatenation of all demos:
-        rows 0..1 = position, rows 2..3 = velocity.
-    Demos are separated by a trailing zero column (attractor padding).
-    """
     raw = sio.loadmat(path)["Data"]              # (4, N)
     pos_all, vel_all = raw[:2, :], raw[2:, :]
 
@@ -60,15 +51,9 @@ def stack(demos):
     return X, Xd
 
 
-# ---------------------------------------------------------------------------
-# 2. GMM mixing functions
-# ---------------------------------------------------------------------------
+ # GMM mixing functions
 def fit_gmm(X, max_components=10, random_state=0):
-    """Fit a Bayesian (Dirichlet-process style) GMM and prune empty components.
 
-    Using BayesianGaussianMixture lets us pick K automatically:
-    components whose effective weight is ~0 are dropped.
-    """
     bgmm = BayesianGaussianMixture(
         n_components=max_components,
         covariance_type="full",
@@ -100,25 +85,8 @@ def posterior(X, weights, means, covs):
     p = np.exp(logp)
     return p / p.sum(axis=0, keepdims=True)
 
-
-# ---------------------------------------------------------------------------
-# 3. Stable LPV-DS optimisation
-# ---------------------------------------------------------------------------
-# Joint optimisation over {A_k} AND P is bilinear (non-convex), so we follow
-# the standard LPV-DS recipe: estimate P first from data, then solve a convex
-# SDP for {A_k} with that P held fixed.
-# ---------------------------------------------------------------------------
+# Stable LPV-DS optimisation
 def estimate_P(X, attractor, alpha=1.0):
-    """Data-driven Lyapunov matrix.
-
-    Idea (Khansari-Zadeh & Billard '11; Figueroa & Billard '18):
-    a quadratic V(x) = (x-x*)^T P (x-x*) is a Lyapunov function for the demos
-    iff its time-derivative is negative along them. We pick P >> 0 that does
-    a reasonable job of that. The simplest robust choice that always works
-    on demos converging to x* is P = alpha * I — and we then *certify* it by
-    checking sign(V_dot) on the demonstration samples after fitting.
-    A slightly better choice rescales axes by demo extent.
-    """
     Xc = X - attractor[:, None]
     # Use inverse covariance scaled to be well-conditioned (whitening style).
     cov = np.cov(Xc) + 1e-3 * np.eye(Xc.shape[0])
@@ -171,10 +139,7 @@ def learn_lpvds(X, Xd, gamma, attractor=None, eps=1e-3):
     b_val = np.stack([-A_val[k] @ attractor for k in range(K)], axis=0)
     return A_val, b_val, P
 
-
-# ---------------------------------------------------------------------------
-# 4. Forward simulation + plotting
-# ---------------------------------------------------------------------------
+# Forward Simulation and Plotting
 def lpvds_velocity(x, weights, means, covs, A, b):
     """f(x) = sum_k gamma_k(x) * (A_k x + b_k).  x: (d,) or (d, N)."""
     if x.ndim == 1:
@@ -256,54 +221,7 @@ def plot_results(demos, weights, means, covs, A, b, save_path):
     plt.close(fig)
     print(f"  saved figure -> {save_path}")
 
-# def plot_results(demos, weights, means, covs, A, b, save_path):
-#     X_all, _ = stack(demos)
-#     pad = 0.5
-#     x_min, x_max = X_all[0].min() - pad, X_all[0].max() + pad
-#     y_min, y_max = X_all[1].min() - pad, X_all[1].max() + pad
-
-#     # Streamline grid
-#     nx, ny = 60, 60
-#     xs = np.linspace(x_min, x_max, nx)
-#     ys = np.linspace(y_min, y_max, ny)
-#     XX, YY = np.meshgrid(xs, ys)
-#     grid = np.vstack([XX.ravel(), YY.ravel()])
-#     V = lpvds_velocity(grid, weights, means, covs, A, b)
-#     U = V[0].reshape(ny, nx)
-#     W = V[1].reshape(ny, nx)
-#     speed = np.sqrt(U ** 2 + W ** 2)
-
-#     fig, ax = plt.subplots(figsize=(9, 7))
-#     ax.streamplot(XX, YY, U, W, color=speed, cmap="viridis",
-#                   density=1.6, linewidth=0.8, arrowsize=0.9)
-
-#     # Demonstrations
-#     colors = ["tab:red", "tab:orange", "tab:purple", "tab:brown"]
-#     for i, (p, _) in enumerate(demos):
-#         ax.plot(p[0], p[1], color=colors[i % len(colors)], lw=2.0,
-#                 label=f"demo {i + 1}")
-#         ax.plot(p[0, 0], p[1, 0], "o", color=colors[i % len(colors)], ms=7)
-
-#     # Attractor + GMM centres
-#     ax.plot(0, 0, "k*", ms=18, label="attractor")
-#     ax.plot(means[:, 0], means[:, 1], "kx", ms=10, mew=2, label="GMM means")
-
-#     ax.set_xlim(x_min, x_max)
-#     ax.set_ylim(y_min, y_max)
-#     ax.set_xlabel("x")
-#     ax.set_ylabel("y")
-#     ax.set_title("LPV-DS on 2D messy-snake")
-#     ax.legend(loc="best", fontsize=9)
-#     ax.set_aspect("equal")
-#     plt.tight_layout()
-#     plt.savefig(save_path, dpi=140)
-#     plt.close(fig)
-#     print(f"  saved figure -> {save_path}")
-
-
-# ---------------------------------------------------------------------------
-# 5. Main
-# ---------------------------------------------------------------------------
+# Main
 def main():
     out_dir = "./outputs"
     os.makedirs(out_dir, exist_ok=True)

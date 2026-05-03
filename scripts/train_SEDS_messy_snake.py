@@ -34,9 +34,7 @@ import pickle
 import os
 
 
-# ---------------------------------------------------------------------------
-# 1. Data loading (identical to the LPV-DS baseline)
-# ---------------------------------------------------------------------------
+# Data loading
 def load_demos(path):
     """Load 2D_messy-snake.mat -> list of (pos, vel) trajectories."""
     raw = sio.loadmat(path)["Data"]
@@ -58,30 +56,11 @@ def stack(demos):
     Xd = np.hstack([v for _, v in demos])
     return X, Xd
 
-
-# ---------------------------------------------------------------------------
-# 2. SEDS parameter packing / unpacking
-# ---------------------------------------------------------------------------
-# A SEDS model is parametrised by {π_k, μ_k, Σ_k} with
-#     μ_k = [μ_k^ξ; μ_k^ξ̇] ∈ R^{2d}
-#     Σ_k = [[Σ_k^ξξ,  Σ_k^ξξ̇];
-#            [Σ_k^ξ̇ξ, Σ_k^ξ̇ξ̇]] ∈ R^{2d x 2d}, symmetric PD.
-# To handle constraints automatically we work with:
-#   - log π_k                        (then softmax to get π_k)
-#   - μ_k^ξ                          (free)
-#   - L_k^ξξ                         (lower-tri Cholesky of Σ_k^ξξ)
-#   - Σ_k^ξξ̇                         (free; gives A_k via Σ_k^ξξ̇ (Σ_k^ξξ)^-1)
-#   - L_k^cond                       (lower-tri Cholesky of conditional cov
-#                                     Σ_k^ξ̇|ξ = Σ_k^ξ̇ξ̇ - Σ_k^ξ̇ξ Σ_k^ξξ⁻¹ Σ_k^ξξ̇)
-# This factorisation guarantees Σ_k ≻ 0 by construction.
-# μ_k^ξ̇ is *not* a free variable: it is fixed to A_k(ξ* - μ_k^ξ) so that
-# b_k = -A_k ξ* and f(ξ*) = 0 (Theorem 1 condition).
-# ---------------------------------------------------------------------------
-def _vec_lower(L, diag_floor=1e-3):
+def vec_lower(L, diag_floor=1e-3):
     """Pack lower-triangular matrix into a flat vector.
 
     Diagonal stored as log(L_ii - diag_floor) so that the unpacked diag is
-    exp(v) + diag_floor ≥ diag_floor. (Inverse of `_unvec_lower`.)
+    exp(v) + diag_floor ≥ diag_floor. (Inverse of `unvec_lower`.)
     """
     d = L.shape[0]
     out = []
@@ -94,8 +73,8 @@ def _vec_lower(L, diag_floor=1e-3):
     return np.array(out)
 
 
-def _unvec_lower(v, d, diag_floor=1e-3):
-    """Inverse of _vec_lower. Keep diagonal ≥ diag_floor for stability."""
+def unvec_lower(v, d, diag_floor=1e-3):
+    """Inverse of vec_lower. Keep diagonal ≥ diag_floor for stability."""
     L = np.zeros((d, d))
     k = 0
     for i in range(d):
@@ -108,24 +87,23 @@ def _unvec_lower(v, d, diag_floor=1e-3):
     return L
 
 
-def _n_lower(d):
+def n_lower(d):
     return d * (d + 1) // 2
 
 
-def _pack(K, d, log_pi, mu_x, L_xx, S_xxd, L_cond):
+def pack(K, d, log_pi, mu_x, L_xx, S_xxd, L_cond):
     """Flatten parameters into a single 1-D vector."""
     parts = [log_pi]
     for k in range(K):
         parts.append(mu_x[k])                        # d
-        parts.append(_vec_lower(L_xx[k]))            # d(d+1)/2
+        parts.append(vec_lower(L_xx[k]))            # d(d+1)/2
         parts.append(S_xxd[k].ravel())               # d*d
-        parts.append(_vec_lower(L_cond[k]))          # d(d+1)/2
+        parts.append(vec_lower(L_cond[k]))          # d(d+1)/2
     return np.concatenate(parts)
 
 
-def _unpack(theta, K, d):
-    """Inverse of _pack."""
-    nL = _n_lower(d)
+def unpack(theta, K, d):
+    nL = n_lower(d)
     log_pi = theta[:K]
     off = K
     mu_x   = np.zeros((K, d))
@@ -134,16 +112,14 @@ def _unpack(theta, K, d):
     L_cond = np.zeros((K, d, d))
     for k in range(K):
         mu_x[k]   = theta[off:off + d];          off += d
-        L_xx[k]   = _unvec_lower(theta[off:off + nL], d); off += nL
+        L_xx[k]   = unvec_lower(theta[off:off + nL], d); off += nL
         S_xxd[k]  = theta[off:off + d * d].reshape(d, d); off += d * d
-        L_cond[k] = _unvec_lower(theta[off:off + nL], d); off += nL
+        L_cond[k] = unvec_lower(theta[off:off + nL], d); off += nL
     return log_pi, mu_x, L_xx, S_xxd, L_cond
 
 
-# ---------------------------------------------------------------------------
-# 3. SEDS forward pass: GMR with parameters expressed via the factorisation
-# ---------------------------------------------------------------------------
-def _model_to_lpv(log_pi, mu_x, L_xx, S_xxd, L_cond, attractor):
+# SEDS forward
+def model_to_lpv(log_pi, mu_x, L_xx, S_xxd, L_cond, attractor):
     """Convert the factorised parameters into per-component (A_k, b_k, μ_k, Σ_k^ξξ).
 
     Returns
@@ -176,8 +152,8 @@ def _model_to_lpv(log_pi, mu_x, L_xx, S_xxd, L_cond, attractor):
     return pi, mu_x, Sxx, A, b, mu_xd
 
 
-def _h_weights(X, pi, mu_x, Sxx):
-    """Posterior responsibility h_k(ξ_i)  -  shape (K, M)."""
+def h_weights(X, pi, mu_x, Sxx):
+
     K, d = mu_x.shape
     M = X.shape[1]
     log_h = np.empty((K, M))
@@ -193,23 +169,20 @@ def _h_weights(X, pi, mu_x, Sxx):
     return h / h.sum(axis=0, keepdims=True)
 
 
-def _gmr_predict(X, pi, mu_x, Sxx, A, mu_xd):
+def gmr_predict(X, pi, mu_x, Sxx, A, mu_xd):
     """ξ̇(ξ) = Σ_k h_k(ξ) [ μ_k^ξ̇ + A_k (ξ - μ_k^ξ) ].
 
     Returns shape (d, M).
     """
-    h = _h_weights(X, pi, mu_x, Sxx)
+    h = h_weights(X, pi, mu_x, Sxx)
     K, d = mu_x.shape
     out = np.zeros((d, X.shape[1]))
     for k in range(K):
         out += h[k][None, :] * (mu_xd[k][:, None] + A[k] @ (X - mu_x[k][:, None]))
     return out
 
-
-# ---------------------------------------------------------------------------
-# 4. Initialisation: standard EM-GMM on the joint (ξ, ξ̇) space
-# ---------------------------------------------------------------------------
-def _project_to_stable(A, eps=0.1):
+# Init EM-GMM
+def project_to_stable(A, eps=0.1):
     """Project A so that A + A^T is negative-definite.
 
     Decompose A = (A+Aᵀ)/2 + (A-Aᵀ)/2 = S + W (symmetric + skew).
@@ -224,7 +197,7 @@ def _project_to_stable(A, eps=0.1):
     return S_clipped + W
 
 
-def _init_from_em(X, Xd, K, attractor, seed=0):
+def init_from_em(X, Xd, K, attractor, seed=0):
     d = X.shape[0]
     Z = np.vstack([X, Xd]).T                           # (M, 2d)
     gmm = GaussianMixture(n_components=K, covariance_type="full",
@@ -242,7 +215,7 @@ def _init_from_em(X, Xd, K, attractor, seed=0):
 
         # Project so that A_k = Sxxd_k^T Sxx_k^-1 is "stable" (sym part neg def)
         A_init = Sxxd_k.T @ np.linalg.solve(Sxx_k, np.eye(d))
-        A_proj = _project_to_stable(A_init, eps=0.1)
+        A_proj = project_to_stable(A_init, eps=0.1)
         Sxxd_k_proj = (A_proj @ Sxx_k).T               # = Σ^ξξ̇  (Σ^ξ̇ξ = A Σ^ξξ)
 
         # conditional covariance (recompute with projected ξ̇ block consistent)
@@ -259,41 +232,31 @@ def _init_from_em(X, Xd, K, attractor, seed=0):
     return log_pi, mu_x, L_xx, S_xxd, L_cond
 
 
-# ---------------------------------------------------------------------------
-# 5. Main SEDS optimisation (constrained SQP)
-# ---------------------------------------------------------------------------
-def fit_seds(X, Xd, K, attractor=None, max_iter=200, seed=0, verbose=True):
-    """Fit a SEDS model via constrained nonlinear optimisation.
+# Main SEDS optimization (constrained SQP)
 
-    Returns a dict with the LPV form (pi, mu_x, Sxx, A, b, mu_xd, attractor).
-    """
+def fit_seds(X, Xd, K, attractor=None, max_iter=200, seed=0, verbose=True):
+
     d = X.shape[0]
     if attractor is None:
         attractor = np.zeros(d)
 
     # 1) Initialise from a vanilla joint-space EM-GMM
-    log_pi0, mu_x0, L_xx0, S_xxd0, L_cond0 = _init_from_em(X, Xd, K, attractor, seed)
-    theta0 = _pack(K, d, log_pi0, mu_x0, L_xx0, S_xxd0, L_cond0)
+    log_pi0, mu_x0, L_xx0, S_xxd0, L_cond0 = init_from_em(X, Xd, K, attractor, seed)
+    theta0 = pack(K, d, log_pi0, mu_x0, L_xx0, S_xxd0, L_cond0)
 
     # 2) Objective: mean-squared GMR prediction error
     def objective(theta):
-        log_pi, mu_x, L_xx, S_xxd, L_cond = _unpack(theta, K, d)
-        pi, mu_x, Sxx, A, b, mu_xd = _model_to_lpv(
+        log_pi, mu_x, L_xx, S_xxd, L_cond = unpack(theta, K, d)
+        pi, mu_x, Sxx, A, b, mu_xd = model_to_lpv(
             log_pi, mu_x, L_xx, S_xxd, L_cond, attractor)
-        pred = _gmr_predict(X, pi, mu_x, Sxx, A, mu_xd)
+        pred = gmr_predict(X, pi, mu_x, Sxx, A, mu_xd)
         return float(np.mean((pred - Xd) ** 2))
 
-    # 3) Stability constraint: A_k + A_k^T ≺ 0 for every k (Theorem 1).
-    # We enforce this through *smooth* polynomial inequalities, which SLSQP
-    # handles much better than eigenvalue-max:
-    #   2D case:  trace(A+Aᵀ) < 0  AND  det(A+Aᵀ) > 0
-    #             (a 2x2 symmetric matrix is neg-def iff both hold)
-    #   General d: rely on each leading principal minor of -(A+Aᵀ) being
-    #              positive (Sylvester's criterion).
     eps = 5e-2
+
     def stability_con(theta):
-        _, mu_x_, L_xx_, S_xxd_, L_cond_ = _unpack(theta, K, d)
-        _, _, _, A_, _, _ = _model_to_lpv(
+        _, mu_x_, L_xx_, S_xxd_, L_cond_ = unpack(theta, K, d)
+        _, _, _, A_, _, _ = model_to_lpv(
             np.zeros(K), mu_x_, L_xx_, S_xxd_, L_cond_, attractor)
         out = []
         for k in range(K):
@@ -322,17 +285,14 @@ def fit_seds(X, Xd, K, attractor=None, max_iter=200, seed=0, verbose=True):
     if verbose:
         print(f"   final loss   = {res.fun:.4e}  ({res.message})")
 
-    log_pi, mu_x, L_xx, S_xxd, L_cond = _unpack(theta_opt, K, d)
-    pi, mu_x, Sxx, A, b, mu_xd = _model_to_lpv(
+    log_pi, mu_x, L_xx, S_xxd, L_cond = unpack(theta_opt, K, d)
+    pi, mu_x, Sxx, A, b, mu_xd = model_to_lpv(
         log_pi, mu_x, L_xx, S_xxd, L_cond, attractor)
-
-    # Safety net: SLSQP may finish marginally infeasible. Project any A_k
-    # whose symmetric part is not yet negative-definite. This guarantees the
-    # final model is GAS, at the cost of a tiny extra fit error.
+    
     for k in range(K):
         sym = A[k] + A[k].T
         if np.linalg.eigvalsh(sym).max() > -1e-3:
-            A[k] = _project_to_stable(A[k], eps=0.05)
+            A[k] = project_to_stable(A[k], eps=0.05)
             mu_xd[k] = A[k] @ (mu_x[k] - attractor)
             b[k] = -A[k] @ attractor
     if verbose:
@@ -342,16 +302,13 @@ def fit_seds(X, Xd, K, attractor=None, max_iter=200, seed=0, verbose=True):
     return dict(pi=pi, mu_x=mu_x, Sxx=Sxx, A=A, b=b, mu_xd=mu_xd,
                 attractor=attractor, history=history)
 
-
-# ---------------------------------------------------------------------------
-# 6. Forward simulation
-# ---------------------------------------------------------------------------
+# Forward Simulation
 def seds_velocity(x, model):
     """f(ξ) = Σ_k h_k(ξ) [ μ_k^ξ̇ + A_k (ξ - μ_k^ξ) ].  x: (d,) or (d, N)."""
     one_d = x.ndim == 1
     if one_d:
         x = x[:, None]
-    out = _gmr_predict(x, model["pi"], model["mu_x"], model["Sxx"],
+    out = gmr_predict(x, model["pi"], model["mu_x"], model["Sxx"],
                        model["A"], model["mu_xd"])
     return out[:, 0] if one_d else out
 
@@ -367,10 +324,7 @@ def simulate(x0, model, dt=0.01, T=4000, tol=1e-3):
             break
     return np.array(traj).T
 
-
-# ---------------------------------------------------------------------------
-# 7. Plotting (mirrors the LPV-DS baseline plot for easy comparison)
-# ---------------------------------------------------------------------------
+# Plotting
 def plot_results(demos, model, save_path):
     X_all, _ = stack(demos)
     pad = 0.5
