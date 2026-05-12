@@ -45,10 +45,42 @@ def load_demos(path):
 
 
 def stack(demos):
-    """Concatenate every (pos, vel) pair column-wise."""
     X = np.hstack([p for p, _ in demos])
     Xd = np.hstack([v for _, v in demos])
     return X, Xd
+
+
+def preprocess(demos):
+    """Three-step preprocessing:
+      1. Min-max normalize positions (and velocities) to [-1, 1].
+      2. Shift attractor (mean of demo endpoints) to the origin.
+      3. Re-normalize to [-1, 1] by dividing by the per-axis max absolute
+         value — scale-only, no shift, so the attractor stays at the origin.
+
+    Returns preprocessed demos; attractor is np.zeros(d) by construction.
+    """
+    # Step 1: global min-max normalise to [-1, 1]
+    all_pos = np.hstack([p for p, _ in demos])
+    p_min = all_pos.min()
+    p_max = all_pos.max()
+    s1 = 2.0 / (p_max - p_min)
+
+    demos1 = [((p - p_min) * s1 - 1.0, v * s1) for p, v in demos]
+
+    # Step 2: shift attractor (mean of endpoints) to origin
+    att1 = np.mean(
+        np.hstack([p[:, -1:] for p, _ in demos1]), axis=1, keepdims=True
+    )
+    demos2 = [(p - att1, v) for p, v in demos1]
+
+    # Step 3: re-normalise to [-1, 1] via per-axis max-abs scaling (no shift)
+    # This keeps the attractor at the origin.
+    all_pos2 = np.hstack([p for p, _ in demos2])
+    s2 = 1.0 / np.abs(all_pos2).max()  
+
+    demos3 = [(p * s2, v * s2) for p, v in demos2]
+
+    return demos3, np.zeros(all_pos.shape[0])
 
 
  # GMM mixing functions
@@ -67,7 +99,7 @@ def fit_gmm(X, max_components=10, random_state=0):
     K = int(keep.sum())
     weights = bgmm.weights_[keep] / bgmm.weights_[keep].sum()
     means   = bgmm.means_[keep]                 # (K, d)
-    covs    = bgmm.covariances_[keep]           # (K, d, d)
+    covs    = bgmm.covariances_[keep] * 4.0 # multiply cov inflate           # (K, d, d)
     print(f"  -> kept {K} active components (out of {max_components})")
     return weights, means, covs
 
@@ -114,7 +146,8 @@ def learn_lpvds(X, Xd, gamma, attractor=None, eps=1e-3):
         attractor = np.zeros(d)
     Xc = X - attractor[:, None]
 
-    P = estimate_P(X, attractor)
+    # P = estimate_P(X, attractor)
+    P = np.eye(d)
     print(f"   P eigenvalues: {np.linalg.eigvalsh(P)}")
 
     Ak = [cp.Variable((d, d)) for _ in range(K)]
@@ -164,11 +197,46 @@ def simulate(x0, weights, means, covs, A, b, dt=0.01, T=2000, tol=1e-3):
         if np.linalg.norm(v) < tol:
             break
     return np.array(traj).T
+
+
+def dtw_distance(P, Q):
+    """DTW distance between trajectories P (d, T1) and Q (d, T2)."""
+    n, m = P.shape[1], Q.shape[1]
+    dtw = np.full((n + 1, m + 1), np.inf)
+    dtw[0, 0] = 0.0
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = np.linalg.norm(P[:, i - 1] - Q[:, j - 1])
+            dtw[i, j] = cost + min(dtw[i-1, j], dtw[i, j-1], dtw[i-1, j-1])
+    return dtw[n, m]
+
+
+def compute_metrics(demos, weights, means, covs, A, b):
+    """Compute per-demo DTWD and overall velocity RMSE."""
+    # Velocity RMSE over all demo data
+    X_all = np.hstack([p for p, _ in demos])
+    Xd_all = np.hstack([v for _, v in demos])
+    Xd_pred = lpvds_velocity(X_all, weights, means, covs, A, b)
+    vel_rmse = np.sqrt(np.mean(np.sum((Xd_pred - Xd_all) ** 2, axis=0)))
+
+    # DTWD: reproduced trajectory vs. demonstration
+    dtwds = []
+    for i, (p, _) in enumerate(demos):
+        repro = simulate(p[:, 0].copy(), weights, means, covs, A, b,
+                         dt=0.01, T=4000, tol=1e-3)
+        d = dtw_distance(p, repro)
+        dtwds.append(d)
+        print(f"   demo {i+1}: DTWD = {d:.4f}")
+
+    mean_dtwd = float(np.mean(dtwds))
+    print(f"   Mean DTWD     = {mean_dtwd:.4f}")
+    print(f"   Velocity RMSE = {vel_rmse:.4f}")
+    return mean_dtwd, vel_rmse
+
+
 def plot_results(demos, weights, means, covs, A, b, save_path):
-    X_all, _ = stack(demos)
-    pad = 0.5
-    x_min, x_max = X_all[0].min() - pad, X_all[0].max() + pad
-    y_min, y_max = X_all[1].min() - pad, X_all[1].max() + pad
+    x_min, x_max = -1.5, 1.5
+    y_min, y_max = -1.5, 1.5
  
     # Streamline grid
     nx, ny = 60, 60
@@ -226,28 +294,38 @@ def main():
     out_dir = "./outputs"
     os.makedirs(out_dir, exist_ok=True)
 
-    print("[1/4] Loading demonstrations ...")
-    demos = load_demos("third_party/corl18/2D_messy-snake.mat")
-    for i, (p, v) in enumerate(demos):
+    print("[1/5] Loading demonstrations ...")
+    demos_raw = load_demos("third_party/corl18/2D_messy-snake.mat")
+    for i, (p, v) in enumerate(demos_raw):
         print(f"   demo {i + 1}: {p.shape[1]} samples,"
               f" start=({p[0,0]:.2f},{p[1,0]:.2f}),"
               f" end=({p[0,-1]:.2f},{p[1,-1]:.2f})")
+
+    print("[2/5] Preprocessing (min-max -> shift attractor -> re-normalize) ...")
+    demos, attractor = preprocess(demos_raw)
     X, Xd = stack(demos)
     print(f"   total: {X.shape[1]} (pos, vel) pairs")
 
-    print("[2/4] Fitting GMM (Bayesian, auto-K) ...")
+    print("[3/5] Fitting GMM (Bayesian, auto-K) ...")
     weights, means, covs = fit_gmm(X, max_components=10)
     gamma = posterior(X, weights, means, covs)
 
-    print("[3/4] Solving stable LPV-DS SDP ...")
-    A, b, P = learn_lpvds(X, Xd, gamma, attractor=np.zeros(2), eps=1e-3)
+    print("[4/5] Solving stable LPV-DS SDP ...")
+    A, b, P = learn_lpvds(X, Xd, gamma, attractor=attractor, eps=1e-3)
+    
+    # Gamma sharpness
+    entropy = (-gamma * np.log(gamma + 1e-12)).sum(axis=0).mean()
+    print(f"gamma avg entropy: {entropy:.3f} / log(K)={np.log(len(weights)):.3f}")
 
     # Sanity-check eigenvalues of A_k^T P + P A_k
     for k in range(len(weights)):
         eigs = np.linalg.eigvalsh(A[k].T @ P + P @ A[k])
         print(f"   comp {k}: max eig(AᵀP+PA) = {eigs.max(): .3e}  (should be < 0)")
 
-    print("[4/4] Plotting & saving ...")
+    print("[5/6] Computing metrics ...")
+    compute_metrics(demos, weights, means, covs, A, b)
+
+    print("[6/6] Plotting & saving ...")
     fig_path = os.path.join(out_dir, "lpvds_messy_snake.png")
     plot_results(demos, weights, means, covs, A, b, fig_path)
 
@@ -255,7 +333,7 @@ def main():
     with open(model_path, "wb") as f:
         pickle.dump(
             dict(weights=weights, means=means, covs=covs, A=A, b=b, P=P,
-                 attractor=np.zeros(2)),
+                 attractor=attractor),
             f,
         )
     print(f"  saved model   -> {model_path}")

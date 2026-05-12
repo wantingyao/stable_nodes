@@ -56,6 +56,43 @@ def stack(demos):
     Xd = np.hstack([v for _, v in demos])
     return X, Xd
 
+
+def preprocess(demos):
+    """Three-step preprocessing:
+      1. Min-max normalize positions (and velocities) to [-1, 1].
+      2. Shift attractor (mean of demo endpoints) to the origin.
+      3. Re-normalize to [-1, 1] by dividing by the per-axis max absolute
+         value — scale-only, no shift, so the attractor stays at the origin.
+
+    Returns preprocessed demos; attractor is np.zeros(d) by construction.
+    """
+    # Step 1: global min-max normalise to [-1, 1]
+    all_pos = np.hstack([p for p, _ in demos])          # (d, N_total)
+    # p_min = all_pos.min(axis=1, keepdims=True)
+    # p_max = all_pos.max(axis=1, keepdims=True)
+    p_min = all_pos.min()
+    p_max = all_pos.max()
+    s1 = 2.0 / (p_max - p_min)
+
+    demos1 = [((p - p_min) * s1 - 1.0, v * s1) for p, v in demos]
+
+    # Step 2: shift attractor (mean of endpoints) to origin
+    att1 = np.mean(
+        np.hstack([p[:, -1:] for p, _ in demos1]), axis=1, keepdims=True
+    )
+    demos2 = [(p - att1, v) for p, v in demos1]
+
+    # Step 3: re-normalise to [-1, 1] via per-axis max-abs scaling (no shift)
+    # This keeps the attractor at the origin.
+    all_pos2 = np.hstack([p for p, _ in demos2])
+    # s2 = 1.0 / np.abs(all_pos2).max(axis=1, keepdims=True)
+    s2 = 1.0 / np.abs(all_pos2).max()
+
+    demos3 = [(p * s2, v * s2) for p, v in demos2]
+
+    return demos3, np.zeros(all_pos.shape[0])
+
+
 def vec_lower(L, diag_floor=1e-3):
     """Pack lower-triangular matrix into a flat vector.
 
@@ -245,14 +282,25 @@ def fit_seds(X, Xd, K, attractor=None, max_iter=200, seed=0, verbose=True):
     theta0 = pack(K, d, log_pi0, mu_x0, L_xx0, S_xxd0, L_cond0)
 
     # 2) Objective: mean-squared GMR prediction error
+    # def objective(theta):
+    #     log_pi, mu_x, L_xx, S_xxd, L_cond = unpack(theta, K, d)
+    #     pi, mu_x, Sxx, A, b, mu_xd = model_to_lpv(
+    #         log_pi, mu_x, L_xx, S_xxd, L_cond, attractor)
+    #     pred = gmr_predict(X, pi, mu_x, Sxx, A, mu_xd)
+    #     return float(np.mean((pred - Xd) ** 2))
+    mu_x_init = mu_x0.copy()  # init_from_em 호출 후 저장
+
     def objective(theta):
         log_pi, mu_x, L_xx, S_xxd, L_cond = unpack(theta, K, d)
-        pi, mu_x, Sxx, A, b, mu_xd = model_to_lpv(
+        pi, _, Sxx, A, b, mu_xd = model_to_lpv(
             log_pi, mu_x, L_xx, S_xxd, L_cond, attractor)
         pred = gmr_predict(X, pi, mu_x, Sxx, A, mu_xd)
-        return float(np.mean((pred - Xd) ** 2))
+        mse = np.mean((pred - Xd) ** 2)
+        anchor_penalty = 1.0 * np.sum((mu_x - mu_x_init) ** 2)
+        return float(mse + anchor_penalty)
 
-    eps = 5e-2
+    # eps = 5e-2
+    eps = 1e-2
 
     def stability_con(theta):
         _, mu_x_, L_xx_, S_xxd_, L_cond_ = unpack(theta, K, d)
@@ -324,12 +372,44 @@ def simulate(x0, model, dt=0.01, T=4000, tol=1e-3):
             break
     return np.array(traj).T
 
+# Metrics
+def dtw_distance(P, Q):
+    """DTW distance between trajectories P (d, T1) and Q (d, T2)."""
+    n, m = P.shape[1], Q.shape[1]
+    dtw = np.full((n + 1, m + 1), np.inf)
+    dtw[0, 0] = 0.0
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = np.linalg.norm(P[:, i - 1] - Q[:, j - 1])
+            dtw[i, j] = cost + min(dtw[i-1, j], dtw[i, j-1], dtw[i-1, j-1])
+    return dtw[n, m]
+
+
+
+def compute_metrics(demos, model):
+    """Compute per-demo DTWD and overall velocity RMSE."""
+    X_all  = np.hstack([p for p, _ in demos])
+    Xd_all = np.hstack([v for _, v in demos])
+    Xd_pred = seds_velocity(X_all, model)
+    vel_rmse = np.sqrt(np.mean(np.sum((Xd_pred - Xd_all) ** 2, axis=0)))
+
+    dtwds = []
+    for i, (p, _) in enumerate(demos):
+        repro = simulate(p[:, 0].copy(), model, dt=0.01, T=4000, tol=1e-3)
+        d = dtw_distance(p, repro)
+        dtwds.append(d)
+        print(f"   demo {i+1}: DTWD = {d:.4f}")
+
+    mean_dtwd = float(np.mean(dtwds))
+    print(f"   Mean DTWD     = {mean_dtwd:.4f}")
+    print(f"   Velocity RMSE = {vel_rmse:.4f}")
+    return mean_dtwd, vel_rmse
+
+
 # Plotting
 def plot_results(demos, model, save_path):
-    X_all, _ = stack(demos)
-    pad = 0.5
-    x_min, x_max = X_all[0].min() - pad, X_all[0].max() + pad
-    y_min, y_max = X_all[1].min() - pad, X_all[1].max() + pad
+    x_min, x_max = -1.5, 1.5
+    y_min, y_max = -1.5, 1.5
 
     nx = ny = 60
     xs = np.linspace(x_min, x_max, nx)
@@ -367,7 +447,7 @@ def plot_results(demos, model, save_path):
     ax.set_title("SEDS on 2D messy-snake")
     ax.legend(loc="best", fontsize=9)
     plt.tight_layout()
-    plt.savefig(save_path, dpi=140); plt.close(fig)
+    plt.savefig(save_path, dpi=300); plt.close(fig)
     print(f"  saved figure -> {save_path}")
 
 
@@ -378,20 +458,24 @@ def main():
     out_dir = "./outputs"
     os.makedirs(out_dir, exist_ok=True)
 
-    print("[1/4] Loading demonstrations ...")
-    demos = load_demos("third_party/corl18/2D_messy-snake.mat")
-    for i, (p, v) in enumerate(demos):
+    print("[1/5] Loading demonstrations ...")
+    demos_raw = load_demos("third_party/corl18/2D_messy-snake.mat")
+    for i, (p, v) in enumerate(demos_raw):
         print(f"   demo {i + 1}: {p.shape[1]} samples,"
               f" start=({p[0,0]:.2f},{p[1,0]:.2f}),"
               f" end=({p[0,-1]:.2f},{p[1,-1]:.2f})")
+
+    print("[2/5] Preprocessing (min-max -> shift attractor -> re-normalize) ...")
+    demos, attractor = preprocess(demos_raw)
     X, Xd = stack(demos)
     print(f"   total: {X.shape[1]} (pos, vel) pairs")
+    print(f"   attractor in preprocessed space: ({attractor[0]:.4f}, {attractor[1]:.4f})")
 
-    K = 6                    # SEDS is sensitive to K; 4-8 is typical for LASA
-    print(f"[2/4] Initialising SEDS from joint-space EM-GMM (K={K}) ...")
+    K = 10                    # SEDS is sensitive to K; 4-8 is typical for LASA
+    print(f"[3/5] Initialising SEDS from joint-space EM-GMM (K={K}) ...")
 
-    print("[3/4] Optimising SEDS parameters under stability constraints ...")
-    model = fit_seds(X, Xd, K=K, attractor=np.zeros(2),
+    print("[4/5] Optimising SEDS parameters under stability constraints ...")
+    model = fit_seds(X, Xd, K=K, attractor=attractor,
                      max_iter=200, seed=0, verbose=True)
 
     # Sanity check: A_k + A_k^T must be negative-definite for all k
@@ -400,7 +484,10 @@ def main():
         emax = np.linalg.eigvalsh(sym).max()
         print(f"   comp {k}: max eig(A+Aᵀ) = {emax:+.3e}  (should be < 0)")
 
-    print("[4/4] Plotting & saving ...")
+    print("[5/5] Computing metrics ...")
+    compute_metrics(demos, model)
+
+    print("[6/6] Plotting & saving ...")
     fig_path   = os.path.join(out_dir, "seds_messy_snake.png")
     model_path = os.path.join(out_dir, "seds_messy_snake.pkl")
     plot_results(demos, model, fig_path)
